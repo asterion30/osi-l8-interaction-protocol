@@ -1,0 +1,16 @@
+# Sistema Operativo
+.DS_Store
+Thumbs.db
+
+# Temporales de editores
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Binarios y builds de kernel / eBPF futuros
+*.o
+*.so
+build/
+dist/
