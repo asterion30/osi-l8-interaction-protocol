@@ -1,0 +1,10 @@
+[package]
+name = "ilp-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["OSI Layer 8 Working Group <ilp-spec@asterion.org>"]
+description = "Reference prototype for OSI Layer 8 Interaction Protocol (ILP / RFC-ILP-2026)"
+license = "MIT"
+
+[dependencies]
+# Standard library first design: zero external dependencies required for core wire protocol and MSAC firewall!

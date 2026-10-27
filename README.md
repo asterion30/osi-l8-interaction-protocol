@@ -32,6 +32,9 @@
 - [7. Posicionamiento frente al Estado del Arte (2024–2026)](#7-posicionamiento-frente-al-estado-del-arte-20242026)
 - [8. Vector de Amenazas Cognitivas y Mitigación por Diseño](#8-vector-de-amenazas-cognitivas-y-mitigación-por-diseño)
 - [Estructura del Proyecto y Hoja de Ruta](#estructura-del-proyecto-y-hoja-de-ruta)
+- [Prototipo de Referencia en Rust e Instrucciones de Prueba](#prototipo-de-referencia-en-rust-e-instrucciones-de-prueba)
+  - [Ejecución de Pruebas](#ejecución-de-pruebas)
+  - [Demostrador CLI](#demostrador-cli)
 - [Licenciamiento](#licenciamiento)
 - [Cita del Documento](#cita-del-documento)
 
@@ -286,12 +289,52 @@ flowchart LR
 ```text
 osi-l8-interaction-protocol/
 ├── README.md                                             # Este documento exhaustivo de especificación
+├── TESTING.md                                            # Reporte detallado de pruebas automatizadas y validación
+├── Cargo.toml                                            # Crate de Rust ilp-core
 ├── LICENSE                                               # Licencia MIT para código y esquemas
 ├── LICENSE-DOCS                                          # Licencia Creative Commons Attribution 4.0 para el texto
 ├── Paper de Referencia - Capa 8 de Interaccion OSI (ILP).pdf # Borrador original en PDF
-├── spec/                                                 # Futuras especificaciones formales (RFC / ISO drafts)
-├── ebpf/                                                 # Implementación de referencia de filtros LSM/eBPF
-└── proto/                                                # Definiciones de cabecera binaria (C structs, Protobuf, Rust)
+├── src/                                                  # Implementación del Prototipo en Rust
+│   ├── lib.rs                                            # Re-exportaciones de la biblioteca ilp-core
+│   ├── ipdu/                                             # Núcleo I-PDU: cabecera binaria, bitfields, serialización
+│   │   ├── flags.rs                                      # CognitivePolicyFlags (16 bits)
+│   │   ├── performatives.rs                              # Speech Acts (DISCOVER, PROPOSE, COMMIT, etc.)
+│   │   ├── header.rs                                     # IpduHeader (Word 0, Big-Endian pack/unpack)
+│   │   └── packet.rs                                     # IpduPacket (Cabecera + Length Prefix + Payload)
+│   ├── governance/                                       # Firewall Cognitivo (MSAC / CRM)
+│   │   ├── taint.rs                                      # TaintTag y ProcessTaintContext
+│   │   ├── policy.rs                                     # UserGovernancePolicy (Sovereign Rules Engine)
+│   │   ├── gatekeeper.rs                                 # SLM Gatekeeper (Detector DLP y Prompt Injection)
+│   │   └── firewall.rs                                   # CognitiveFirewall (Pipeline de 3 pasos y auditoría)
+│   └── main.rs                                           # Demostrador CLI interactivo con hexdump en vivo
+└── tests/                                                # Suite de integración (14 tests automatizados)
+    ├── test_ipdu_wire.rs                                 # Pruebas de empaquetado binario y roundtrip
+    ├── test_firewall_msac.rs                             # Pruebas de intercepción en los 3 pasos MSAC
+    └── test_handshake_simulation.rs                      # Simulación completa del 3-Way Intent Handshake
+```
+
+---
+
+## Prototipo de Referencia en Rust e Instrucciones de Prueba
+
+El repositorio incluye una implementación de referencia ejecutable **100% en Rust** (`ilp-core`) con **cero dependencias externas obligatorias** (diseñada sobre la biblioteca estándar para máxima portabilidad y compatibilidad de bajo nivel con sockets y futuros programas eBPF).
+
+### Ejecución de Pruebas
+
+Para ejecutar la suite completa de 14 pruebas de integración y verificar la conformidad del protocolo:
+
+```bash
+cargo test --verbose
+```
+
+Para una explicación exhaustiva de cada prueba unitaria, casos de contorno y cobertura, consulta [`TESTING.md`](TESTING.md).
+
+### Demostrador CLI
+
+Para observar el desglose a nivel de bits de la cabecera I-PDU, su hexdump en el cable de red y la intercepción en vivo de los 6 escenarios de gobernanza del firewall cognitivo (MSAC):
+
+```bash
+cargo run
 ```
 
 ---
