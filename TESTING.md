@@ -100,9 +100,11 @@ test test_canonical_header_roundtrip ... ok
 test test_complete_packet_roundtrip ... ok
 test test_compact_256bit_header_roundtrip ... ok
 test test_unsupported_version_error ... ok
+test test_validate_frame_bounds_allocation_bomb_defense ... ok
+test test_validate_frame_bounds_truncated_payload ... ok
 test test_word0_packing_and_unpacking ... ok
 
-test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ### Ejecución de la Demostración Interactiva
@@ -110,3 +112,53 @@ test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 cargo run
 ```
 Muestra el desglose de bits de la cabecera I-PDU, su hexdump en el cable y la intercepción en vivo de los 6 casos de uso del firewall cognitivo con su bitácora forense estructurada.
+
+---
+
+## 4. Arquitectura de Fuzzing (`fuzz/` con `cargo-fuzz`)
+
+Para pruebas de estrés continuas, detección de fugas de memoria con **AddressSanitizer** y validación de invariantes formales de seguridad cognitiva, el repositorio incluye una suite completa basada en `cargo-fuzz` y `libfuzzer-sys`:
+
+```text
+fuzz/
+├── Cargo.toml
+└── fuzz_targets/
+    ├── fuzz_wire_parser.rs      # Target 1: Fuzzing de cable y roundtrip
+    └── fuzz_msac_pipeline.rs     # Target 2: Fuzzing estructurado de invariantes MSAC
+```
+
+### 4.1. Blindaje Preventivo en el Parser (`src/ipdu/packet.rs`)
+Antes de invocar el deserializador, se aplican validaciones deterministas en $O(1)$ sin reservar memoria en el heap:
+- **`MAX_ILP_PAYLOAD_SIZE` (65,536 bytes / 64 KB):** Defensa activa contra *Allocation Bombs* (ataques de denegación de servicio por agotamiento de memoria OOM).
+- **`validate_frame_bounds(raw: &[u8])`:** 
+  1. Verificación de tamaño mínimo de trama (36 bytes cabecera + 4 bytes length prefix).
+  2. Extracción segura con `.try_into()` sin panics.
+  3. Comprobación aritmética con `checked_add` contra desbordamientos (*Integer Overflow*) en sistemas de 32 bits.
+
+### 4.2. Arneses de Prueba
+
+1. **Target 1: `fuzz_wire_parser` (`fuzz/fuzz_targets/fuzz_wire_parser.rs`)**
+   - Somete a estrés los deserializadores `from_canonical_bytes`, `from_compact_bytes` y `from_bytes` con flujos arbitrarios de bytes corruptos.
+   - Comprueba el invariante de roundtrip para cada paquete o cabecera válida.
+
+2. **Target 2: `fuzz_msac_pipeline` (`fuzz/fuzz_targets/fuzz_msac_pipeline.rs`)**
+   - Mediante **Property-Based Fuzzing** con `arbitrary`, genera combinaciones aleatorias de performativas, flags cognitivas, presupuestos y contextos de tinte.
+   - **Invariante 1:** Un proceso con tinte `MEDICAL_PII` o `FINANCIAL_DATA` hacia la red externa jamás puede ser autorizado (`Verdict::Allow`).
+   - **Invariante 2:** Un presupuesto superior al `policy_max_budget` del usuario jamás puede ser autorizado.
+   - **Invariante 3:** Una habilidad presente en la lista negra jamás puede ser autorizada.
+
+### 4.3. Instrucciones de Ejecución de Fuzzing
+Requiere toolchain `nightly` de Rust y `cargo-fuzz`:
+
+```bash
+# 1. Instalar toolchain nightly y cargo-fuzz (si no están presentes)
+rustup toolchain install nightly
+cargo install cargo-fuzz
+
+# 2. Ejecutar Fuzzing del parser de cable
+cargo +nightly fuzz run fuzz_wire_parser -- -max_total_time=60 -rss_limit_mb=2048
+
+# 3. Ejecutar Fuzzing de invariantes de seguridad MSAC
+cargo +nightly fuzz run fuzz_msac_pipeline -- -max_total_time=60 -rss_limit_mb=2048
+```
+

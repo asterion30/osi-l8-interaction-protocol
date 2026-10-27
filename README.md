@@ -307,10 +307,15 @@ osi-l8-interaction-protocol/
 │   │   ├── gatekeeper.rs                                 # SLM Gatekeeper (Detector DLP y Prompt Injection)
 │   │   └── firewall.rs                                   # CognitiveFirewall (Pipeline de 3 pasos y auditoría)
 │   └── main.rs                                           # Demostrador CLI interactivo con hexdump en vivo
-└── tests/                                                # Suite de integración (14 tests automatizados)
-    ├── test_ipdu_wire.rs                                 # Pruebas de empaquetado binario y roundtrip
-    ├── test_firewall_msac.rs                             # Pruebas de intercepción en los 3 pasos MSAC
-    └── test_handshake_simulation.rs                      # Simulación completa del 3-Way Intent Handshake
+├── tests/                                                # Suite de integración (16 tests automatizados)
+│   ├── test_ipdu_wire.rs                                 # Pruebas de empaquetado binario, bounds checking y roundtrip
+│   ├── test_firewall_msac.rs                             # Pruebas de intercepción en los 3 pasos MSAC
+│   └── test_handshake_simulation.rs                      # Simulación completa del 3-Way Intent Handshake
+└── fuzz/                                                 # Suite de Fuzzing con cargo-fuzz (libFuzzer)
+    ├── Cargo.toml
+    └── fuzz_targets/
+        ├── fuzz_wire_parser.rs                           # Fuzzing de cable y deserialización
+        └── fuzz_msac_pipeline.rs                         # Property-based fuzzing de invariantes MSAC
 ```
 
 ---
@@ -321,13 +326,13 @@ El repositorio incluye una implementación de referencia ejecutable **100% en Ru
 
 ### Ejecución de Pruebas
 
-Para ejecutar la suite completa de 14 pruebas de integración y verificar la conformidad del protocolo:
+Para ejecutar la suite completa de 16 pruebas de integración y verificar la conformidad del protocolo:
 
 ```bash
 cargo test --verbose
 ```
 
-Para una explicación exhaustiva de cada prueba unitaria, casos de contorno y cobertura, consulta [`TESTING.md`](TESTING.md).
+Para una explicación exhaustiva de cada prueba unitaria, casos de contorno, arquitectura de fuzzing con `cargo-fuzz` y cobertura, consulta [`TESTING.md`](TESTING.md).
 
 ### Demostrador CLI
 

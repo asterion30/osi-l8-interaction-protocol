@@ -14,6 +14,49 @@ pub struct IpduPacket {
     pub payload: Vec<u8>,
 }
 
+/// Límite duro de protocolo en Capa 8 (64 KB por I-PDU para evitar OOM en Kernel/Userspace).
+pub const MAX_ILP_PAYLOAD_SIZE: usize = 65_536;
+
+/// Verifica de forma determinista el prefijo de longitud sin reservar memoria en el heap.
+pub fn validate_frame_bounds(raw: &[u8]) -> Result<usize, IpduError> {
+    // 1. Verificación de tamaño mínimo (36 bytes cabecera + 4 bytes length prefix)
+    if raw.len() < CANONICAL_HEADER_SIZE + 4 {
+        return Err(IpduError::BufferUnderflow {
+            expected: CANONICAL_HEADER_SIZE + 4,
+            actual: raw.len(),
+        });
+    }
+
+    // 2. Extracción segura sin indexación directa que pueda hacer panic
+    let len_bytes: [u8; 4] = raw[CANONICAL_HEADER_SIZE..CANONICAL_HEADER_SIZE + 4]
+        .try_into()
+        .map_err(|_| IpduError::BufferUnderflow {
+            expected: CANONICAL_HEADER_SIZE + 4,
+            actual: raw.len(),
+        })?;
+
+    let payload_len = u32::from_be_bytes(len_bytes) as usize;
+
+    // 3. Defensa contra Allocation Bomb (OOM)
+    if payload_len > MAX_ILP_PAYLOAD_SIZE {
+        return Err(IpduError::PayloadTooLarge(payload_len));
+    }
+
+    // 4. Verificación aritmética con checked_add para evitar Integer Overflow en 32-bit targets
+    let total_expected = (CANONICAL_HEADER_SIZE + 4)
+        .checked_add(payload_len)
+        .ok_or(IpduError::ArithmeticOverflow)?;
+
+    if raw.len() < total_expected {
+        return Err(IpduError::TruncatedPayload {
+            expected: total_expected,
+            actual: raw.len(),
+        });
+    }
+
+    Ok(payload_len)
+}
+
 impl IpduPacket {
     /// Construye un nuevo paquete I-PDU.
     pub fn new(header: IpduHeader, payload: Vec<u8>) -> Self {
@@ -37,29 +80,10 @@ impl IpduPacket {
         bytes
     }
 
-    /// Deserializa un paquete completo desde un búfer de red.
+    /// Deserializa un paquete completo desde un búfer de red aplicando blindaje de cotas.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, IpduError> {
-        if buf.len() < CANONICAL_HEADER_SIZE + 4 {
-            return Err(IpduError::BufferUnderflow {
-                expected: CANONICAL_HEADER_SIZE + 4,
-                actual: buf.len(),
-            });
-        }
-
+        let payload_len = validate_frame_bounds(buf)?;
         let header = IpduHeader::from_canonical_bytes(&buf[0..CANONICAL_HEADER_SIZE])?;
-        let payload_len = u32::from_be_bytes(
-            buf[CANONICAL_HEADER_SIZE..CANONICAL_HEADER_SIZE + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-
-        let available_payload = buf.len() - (CANONICAL_HEADER_SIZE + 4);
-        if available_payload < payload_len {
-            return Err(IpduError::InvalidPayloadLength {
-                declared: payload_len,
-                actual: available_payload,
-            });
-        }
 
         let payload_start = CANONICAL_HEADER_SIZE + 4;
         let payload = buf[payload_start..payload_start + payload_len].to_vec();

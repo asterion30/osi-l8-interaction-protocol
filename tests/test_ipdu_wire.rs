@@ -128,3 +128,40 @@ fn test_buffer_underflow_error() {
     let res = IpduHeader::from_canonical_bytes(&tiny_buf);
     assert!(matches!(res, Err(IpduError::BufferUnderflow { .. })));
 }
+
+#[test]
+fn test_validate_frame_bounds_allocation_bomb_defense() {
+    use ilp_core::ipdu::{validate_frame_bounds, MAX_ILP_PAYLOAD_SIZE};
+
+    let mut buf = vec![0u8; CANONICAL_HEADER_SIZE + 4];
+    // Payload length declarada: 65_537 (mayor que MAX_ILP_PAYLOAD_SIZE = 65_536)
+    let bad_len = (MAX_ILP_PAYLOAD_SIZE as u32) + 1;
+    buf[CANONICAL_HEADER_SIZE..CANONICAL_HEADER_SIZE + 4].copy_from_slice(&bad_len.to_be_bytes());
+
+    let res = validate_frame_bounds(&buf);
+    assert!(matches!(res, Err(IpduError::PayloadTooLarge(len)) if len == (MAX_ILP_PAYLOAD_SIZE + 1)));
+
+    // También verificamos que from_bytes rechace el paquete sin asignar memoria
+    let packet_res = IpduPacket::from_bytes(&buf);
+    assert!(matches!(packet_res, Err(IpduError::PayloadTooLarge(_))));
+}
+
+#[test]
+fn test_validate_frame_bounds_truncated_payload() {
+    use ilp_core::ipdu::validate_frame_bounds;
+
+    let mut buf = vec![0u8; CANONICAL_HEADER_SIZE + 4 + 10];
+    // Declaramos 100 bytes de payload pero el búfer solo contiene 10
+    let declared_len: u32 = 100;
+    buf[CANONICAL_HEADER_SIZE..CANONICAL_HEADER_SIZE + 4].copy_from_slice(&declared_len.to_be_bytes());
+
+    let res = validate_frame_bounds(&buf);
+    assert!(matches!(
+        res,
+        Err(IpduError::TruncatedPayload {
+            expected: 140, // 36 + 4 + 100
+            actual: 50     // 36 + 4 + 10
+        })
+    ));
+}
+

@@ -17,6 +17,6 @@ pub use governance::{
     TaintTag, UserGovernancePolicy, Verdict,
 };
 pub use ipdu::{
-    CognitivePolicyFlags, IpduError, IpduHeader, IpduPacket, Performative, CANONICAL_HEADER_SIZE,
-    COMPACT_256BIT_HEADER_SIZE, ILP_VERSION_1,
+    validate_frame_bounds, CognitivePolicyFlags, IpduError, IpduHeader, IpduPacket, Performative,
+    CANONICAL_HEADER_SIZE, COMPACT_256BIT_HEADER_SIZE, ILP_VERSION_1, MAX_ILP_PAYLOAD_SIZE,
 };

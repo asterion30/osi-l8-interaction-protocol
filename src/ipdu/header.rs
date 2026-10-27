@@ -214,6 +214,9 @@ pub enum IpduError {
     Performative(PerformativeError),
     BufferUnderflow { expected: usize, actual: usize },
     InvalidPayloadLength { declared: usize, actual: usize },
+    PayloadTooLarge(usize),
+    ArithmeticOverflow,
+    TruncatedPayload { expected: usize, actual: usize },
 }
 
 impl From<PerformativeError> for IpduError {
@@ -233,6 +236,15 @@ impl fmt::Display for IpduError {
             }
             Self::InvalidPayloadLength { declared, actual } => {
                 write!(f, "Longitud de payload inconsistente: declarada {}, real {}", declared, actual)
+            }
+            Self::PayloadTooLarge(len) => {
+                write!(f, "Payload excede el límite máximo de protocolo ({} bytes)", len)
+            }
+            Self::ArithmeticOverflow => {
+                write!(f, "Desbordamiento aritmético al calcular la longitud total de trama")
+            }
+            Self::TruncatedPayload { expected, actual } => {
+                write!(f, "Trama truncada: esperado {} bytes totales, recibidos {}", expected, actual)
             }
         }
     }

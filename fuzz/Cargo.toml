@@ -1,0 +1,27 @@
+[package]
+name = "ilp-core-fuzz"
+version = "0.1.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+ilp-core = { path = ".." }
+
+[[bin]]
+name = "fuzz_wire_parser"
+path = "fuzz_targets/fuzz_wire_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_msac_pipeline"
+path = "fuzz_targets/fuzz_msac_pipeline.rs"
+test = false
+doc = false
+bench = false
