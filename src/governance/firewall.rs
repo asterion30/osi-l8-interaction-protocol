@@ -5,6 +5,7 @@ use crate::ipdu::packet::IpduPacket;
 use crate::governance::gatekeeper::{GatekeeperThreat, SlmGatekeeper};
 use crate::governance::policy::UserGovernancePolicy;
 use crate::governance::taint::{ProcessTaintContext, TaintTag};
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,22 +84,42 @@ impl FilterDecision {
     }
 }
 
+/// Capacidad máxima por defecto del registro de auditoría en memoria (Ring Buffer).
+pub const DEFAULT_MAX_AUDIT_LOG_CAPACITY: usize = 10_000;
+
 /// Cognitive Reference Monitor (CRM): El Firewall Cognitivo de Capa 8.
 #[derive(Debug, Clone)]
 pub struct CognitiveFirewall {
     pub policy: UserGovernancePolicy,
     pub gatekeeper: SlmGatekeeper,
-    pub audit_log: Vec<AuditRecord>,
+    pub audit_log: VecDeque<AuditRecord>,
+    pub max_audit_entries: usize,
 }
 
 impl CognitiveFirewall {
-    /// Instancia un nuevo firewall cognitivo con la política soberana de usuario.
+    /// Instancia un nuevo firewall cognitivo con la política soberana de usuario y Ring Buffer acotado.
     pub fn new(policy: UserGovernancePolicy) -> Self {
+        Self::with_audit_capacity(policy, DEFAULT_MAX_AUDIT_LOG_CAPACITY)
+    }
+
+    /// Instancia un firewall cognitivo con capacidad máxima configurable en su Ring Buffer de auditoría.
+    /// Si `max_audit_entries` es 0, el registro almacena eventos sin límite superior (modo desaconsejado en producción).
+    pub fn with_audit_capacity(policy: UserGovernancePolicy, max_audit_entries: usize) -> Self {
         Self {
             policy,
             gatekeeper: SlmGatekeeper::new(),
-            audit_log: Vec::new(),
+            audit_log: VecDeque::new(),
+            max_audit_entries,
         }
+    }
+
+    /// Registra un evento en el log de auditoría respetando la cota de Ring Buffer (FIFO).
+    #[inline]
+    fn push_audit_record(&mut self, record: AuditRecord) {
+        if self.max_audit_entries > 0 && self.audit_log.len() >= self.max_audit_entries {
+            self.audit_log.pop_front();
+        }
+        self.audit_log.push_back(record);
     }
 
     /// Intercepta y audita atómicamente la emisión de un I-PDU en 3 pasos obligatorios (MSAC).
@@ -141,7 +162,7 @@ impl CognitiveFirewall {
                     reason: reason.clone(),
                     step_failed: Some(1),
                 };
-                self.audit_log.push(record.clone());
+                self.push_audit_record(record.clone());
 
                 return FilterDecision {
                     verdict: Verdict::Drop,
@@ -291,7 +312,7 @@ impl CognitiveFirewall {
             reason: "Verificación MSAC completada con éxito. Políticas conformes.".into(),
             step_failed: None,
         };
-        self.audit_log.push(record.clone());
+        self.push_audit_record(record.clone());
 
         FilterDecision {
             verdict: Verdict::Allow,
@@ -323,7 +344,7 @@ impl CognitiveFirewall {
             reason: reason.clone(),
             step_failed: Some(step),
         };
-        self.audit_log.push(record.clone());
+        self.push_audit_record(record.clone());
 
         FilterDecision {
             verdict: Verdict::Drop,

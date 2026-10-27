@@ -14,7 +14,7 @@ pub mod ipdu;
 // Re-exportaciones principales
 pub use governance::{
     AuditRecord, CognitiveErrorCode, CognitiveFirewall, FilterDecision, ProcessTaintContext,
-    TaintTag, UserGovernancePolicy, Verdict,
+    TaintTag, UserGovernancePolicy, Verdict, DEFAULT_MAX_AUDIT_LOG_CAPACITY,
 };
 pub use ipdu::{
     validate_frame_bounds, CognitivePolicyFlags, IpduError, IpduHeader, IpduPacket, Performative,

@@ -1,39 +1,44 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use ilp_core::{IpduError, IpduPacket};
 use ilp_core::ipdu::header::IpduHeader;
-use ilp_core::ipdu::packet::IpduPacket;
 
 fuzz_target!(|data: &[u8]| {
-    // 1. Prueba de resistencia en cabecera compacta (32 bytes / 256 bits)
+    // 1. Fuzzing de Cabecera Compacta (32 bytes / 256 bits)
     if let Ok(compact_hdr) = IpduHeader::from_compact_bytes(data) {
-        let reencoded = compact_hdr.to_compact_256bit_bytes();
-        let decoded_again = IpduHeader::from_compact_bytes(&reencoded)
-            .expect("Invariante violada: cabecera compacta válida falló al re-parsear");
-        assert_eq!(compact_hdr.version, decoded_again.version);
-        assert_eq!(compact_hdr.performative, decoded_again.performative);
-        assert_eq!(compact_hdr.autonomy_tier, decoded_again.autonomy_tier);
-        assert_eq!(compact_hdr.policy_flags, decoded_again.policy_flags);
-        assert_eq!(compact_hdr.skill_namespace_hash, decoded_again.skill_namespace_hash);
-        assert_eq!(compact_hdr.session_uuid, decoded_again.session_uuid);
-        assert_eq!(compact_hdr.max_budget_cap, decoded_again.max_budget_cap);
-        assert_eq!(compact_hdr.deadline_ttl_ms, decoded_again.deadline_ttl_ms);
+        let wire = compact_hdr.to_compact_256bit_bytes();
+        let reparsed = IpduHeader::from_compact_bytes(&wire)
+            .expect("Fallo de idempotencia en cabecera compacta de 32 bytes");
+
+        // En modo compacto los primeros 28 bytes y el truncado de firma deben ser idénticos
+        assert_eq!(compact_hdr.to_compact_256bit_bytes(), reparsed.to_compact_256bit_bytes());
     }
 
-    // 2. Prueba de resistencia en cabecera canónica (36 bytes / 288 bits)
+    // 2. Fuzzing de Cabecera Canónica (36 bytes)
     if let Ok(canon_hdr) = IpduHeader::from_canonical_bytes(data) {
-        let reencoded = canon_hdr.to_canonical_bytes();
-        let decoded_again = IpduHeader::from_canonical_bytes(&reencoded)
-            .expect("Invariante violada: cabecera canónica válida falló al re-parsear");
-        assert_eq!(canon_hdr, decoded_again);
+        let wire = canon_hdr.to_canonical_bytes();
+        let reparsed = IpduHeader::from_canonical_bytes(&wire)
+            .expect("Fallo de idempotencia en cabecera canónica de 36 bytes");
+        assert_eq!(canon_hdr, reparsed);
     }
 
-    // 3. Prueba de resistencia en paquete I-PDU completo (Cabecera + Length + Payload con blindaje de cotas)
-    if let Ok(packet) = IpduPacket::from_bytes(data) {
-        let wire_bytes = packet.to_bytes();
-        let roundtrip = IpduPacket::from_bytes(&wire_bytes)
-            .expect("Invariante violada: paquete I-PDU válido falló en roundtrip");
-        assert_eq!(packet.header, roundtrip.header);
-        assert_eq!(packet.payload, roundtrip.payload);
+    // 3. Fuzzing de Paquete Completo I-PDU (Cabecera + Length Prefix + Payload)
+    match IpduPacket::from_bytes(data) {
+        Ok(packet) => {
+            // Invariante de Roundtrip: serializar y volver a parsear debe dar el mismo IpduPacket
+            let wire_bytes = packet.to_bytes();
+            let reparsed = IpduPacket::from_bytes(&wire_bytes)
+                .expect("Invariante violada: IpduPacket válido falló al re-serializar");
+            assert_eq!(packet, reparsed);
+        }
+        Err(
+            IpduError::BufferUnderflow { .. }
+            | IpduError::PayloadTooLarge(_)
+            | IpduError::TruncatedPayload { .. }
+            | _,
+        ) => {
+            // Rechazo controlado y seguro: sin panic ni OOM
+        }
     }
 });

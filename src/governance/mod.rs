@@ -5,7 +5,10 @@ pub mod gatekeeper;
 pub mod policy;
 pub mod taint;
 
-pub use firewall::{AuditRecord, CognitiveErrorCode, CognitiveFirewall, FilterDecision, Verdict};
+pub use firewall::{
+    AuditRecord, CognitiveErrorCode, CognitiveFirewall, FilterDecision, Verdict,
+    DEFAULT_MAX_AUDIT_LOG_CAPACITY,
+};
 pub use gatekeeper::{GatekeeperThreat, SlmGatekeeper};
 pub use policy::UserGovernancePolicy;
 pub use taint::{ProcessTaintContext, TaintTag};

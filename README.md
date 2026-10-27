@@ -258,6 +258,7 @@ flowchart LR
 1. **Rastreo de Tinte (*Taint Tracking*):** Si el proceso agéntico leyó un archivo marcado con atributos extendidos del sistema de archivos (ej. `xattr:classification=medical_pii`), la memoria del proceso queda marcada irrevocablemente.
 2. **Inspección de `COGNITIVE_POLICY_FLAGS`:** Si la I-PDU saliente intenta cruzar una interfaz de red externa y la política de usuario en el SO prohíbe `DENY_EGRESS(medical_pii)`, el kernel descarta el paquete instantáneamente con error `-EPERM_COGNITIVE_POLICY`, sin importar el razonamiento del LLM.
 3. **Guardián SLM Embebido (*SLM Gatekeeper*):** Para payloads no estructurados, un clasificador cuantizado ultrarrápido ejecutado en la NPU local (< 5 ms) analiza el contenido antes de permitir el cifrado TLS.
+4. **Integridad Forense y Ring Buffer Bounded:** Toda decisión genera un registro de auditoría estructurado (`AuditRecord`) almacenado en un Ring Buffer FIFO acotado (`VecDeque`, 10.000 eventos por defecto), garantizando la no-repudiación y evitando vectores de agotamiento de memoria (*Memory Exhaustion*) en demonios de ejecución continua o campañas de fuzzing masivas.
 
 ---
 
@@ -307,9 +308,9 @@ osi-l8-interaction-protocol/
 │   │   ├── gatekeeper.rs                                 # SLM Gatekeeper (Detector DLP y Prompt Injection)
 │   │   └── firewall.rs                                   # CognitiveFirewall (Pipeline de 3 pasos y auditoría)
 │   └── main.rs                                           # Demostrador CLI interactivo con hexdump en vivo
-├── tests/                                                # Suite de integración (16 tests automatizados)
+├── tests/                                                # Suite de integración (17 tests automatizados)
 │   ├── test_ipdu_wire.rs                                 # Pruebas de empaquetado binario, bounds checking y roundtrip
-│   ├── test_firewall_msac.rs                             # Pruebas de intercepción en los 3 pasos MSAC
+│   ├── test_firewall_msac.rs                             # Pruebas de intercepción en los 3 pasos MSAC y Ring Buffer
 │   └── test_handshake_simulation.rs                      # Simulación completa del 3-Way Intent Handshake
 └── fuzz/                                                 # Suite de Fuzzing con cargo-fuzz (libFuzzer)
     ├── Cargo.toml
@@ -326,7 +327,7 @@ El repositorio incluye una implementación de referencia ejecutable **100% en Ru
 
 ### Ejecución de Pruebas
 
-Para ejecutar la suite completa de 16 pruebas de integración y verificar la conformidad del protocolo:
+Para ejecutar la suite completa de 17 pruebas de integración y verificar la conformidad del protocolo:
 
 ```bash
 cargo test --verbose

@@ -190,3 +190,31 @@ fn test_msac_step3_gatekeeper_prompt_injection_drop() {
     assert_eq!(decision.error_code, Some(CognitiveErrorCode::EpermPromptInjection));
     assert_eq!(decision.step_failed, Some(3));
 }
+
+#[test]
+fn test_firewall_audit_log_ring_buffer_bounded() {
+    let policy = build_clean_policy();
+    // Firewall configurado con capacidad máxima de 3 registros
+    let mut firewall = CognitiveFirewall::with_audit_capacity(policy, 3);
+    let clean_process = ProcessTaintContext::new(101, "agent", true);
+
+    let packet = IpduPacket::propose_intent(
+        0x1234,
+        0xABCD,
+        1,
+        1_000,
+        5_000,
+        CognitivePolicyFlags::EMPTY,
+        0x9999,
+        "normal payload",
+    )
+    .unwrap();
+
+    // Insertamos 10 inspecciones
+    for _ in 0..10 {
+        let _ = firewall.inspect_egress(&clean_process, &packet);
+    }
+
+    // Debe mantenerse exactamente acotado a 3 elementos sin fuga de memoria
+    assert_eq!(firewall.audit_log.len(), 3);
+}
