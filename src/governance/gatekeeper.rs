@@ -15,9 +15,15 @@ impl fmt::Display for GatekeeperThreat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FinancialExfiltration(msg) => write!(f, "Fuga Financiera (DLP): {}", msg),
-            Self::CredentialLeak(msg) => write!(f, "Fuga de Credenciales (Secret Scanner): {}", msg),
-            Self::GovernmentIdLeak(msg) => write!(f, "Fuga de Identidad Gubernamental (PII): {}", msg),
-            Self::PromptInjectionAttempt(msg) => write!(f, "Inyección de Prompt / Jailbreak Cognitivo: {}", msg),
+            Self::CredentialLeak(msg) => {
+                write!(f, "Fuga de Credenciales (Secret Scanner): {}", msg)
+            }
+            Self::GovernmentIdLeak(msg) => {
+                write!(f, "Fuga de Identidad Gubernamental (PII): {}", msg)
+            }
+            Self::PromptInjectionAttempt(msg) => {
+                write!(f, "Inyección de Prompt / Jailbreak Cognitivo: {}", msg)
+            }
         }
     }
 }
@@ -39,7 +45,11 @@ impl SlmGatekeeper {
         };
 
         // 1. Detección de tokens y claves de API
-        if text.contains("sk-") || text.contains("ghp_") || text.contains("Bearer ") || text.contains("PRIVATE KEY") {
+        if text.contains("sk-")
+            || text.contains("ghp_")
+            || text.contains("Bearer ")
+            || text.contains("PRIVATE KEY")
+        {
             return Err(GatekeeperThreat::CredentialLeak(
                 "Detectado token de API o clave privada en texto plano".into(),
             ));
@@ -59,7 +69,7 @@ impl SlmGatekeeper {
         }
 
         // 3. Detección heurística de tarjetas de crédito con algoritmo de Luhn
-        if let Some(card_num) = Self::find_credit_card_candidate(&text) {
+        if let Some(card_num) = Self::find_credit_card_candidate(text) {
             return Err(GatekeeperThreat::FinancialExfiltration(format!(
                 "Detectado número de tarjeta de crédito válido (terminación ****{})",
                 &card_num[card_num.len().saturating_sub(4)..]

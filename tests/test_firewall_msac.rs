@@ -62,7 +62,10 @@ fn test_msac_step1_medical_taint_blocks_external_egress() {
 
     let decision = firewall.inspect_egress(&tainted_proc, &packet);
     assert_eq!(decision.verdict, Verdict::Drop);
-    assert_eq!(decision.error_code, Some(CognitiveErrorCode::EpermCognitivePolicy));
+    assert_eq!(
+        decision.error_code,
+        Some(CognitiveErrorCode::EpermCognitivePolicy)
+    );
     assert_eq!(decision.step_failed, Some(1));
 }
 
@@ -86,7 +89,10 @@ fn test_msac_step2_budget_exceeded_drop() {
 
     let decision = firewall.inspect_egress(&clean_process, &expensive_packet);
     assert_eq!(decision.verdict, Verdict::Drop);
-    assert_eq!(decision.error_code, Some(CognitiveErrorCode::EpermBudgetExceeded));
+    assert_eq!(
+        decision.error_code,
+        Some(CognitiveErrorCode::EpermBudgetExceeded)
+    );
     assert_eq!(decision.step_failed, Some(2));
 }
 
@@ -111,7 +117,10 @@ fn test_msac_step2_sandbox_required_drop() {
 
     let decision = firewall.inspect_egress(&clean_process, &unconfined_packet);
     assert_eq!(decision.verdict, Verdict::Drop);
-    assert_eq!(decision.error_code, Some(CognitiveErrorCode::EpermSandboxRequired));
+    assert_eq!(
+        decision.error_code,
+        Some(CognitiveErrorCode::EpermSandboxRequired)
+    );
     assert_eq!(decision.step_failed, Some(2));
 }
 
@@ -138,7 +147,10 @@ fn test_msac_step2_forbidden_skill_drop() {
 
     let decision = firewall.inspect_egress(&clean_process, &forbidden_packet);
     assert_eq!(decision.verdict, Verdict::Drop);
-    assert_eq!(decision.error_code, Some(CognitiveErrorCode::EpermForbiddenSkill));
+    assert_eq!(
+        decision.error_code,
+        Some(CognitiveErrorCode::EpermForbiddenSkill)
+    );
     assert_eq!(decision.step_failed, Some(2));
 }
 
@@ -163,7 +175,10 @@ fn test_msac_step3_gatekeeper_credit_card_drop() {
 
     let decision = firewall.inspect_egress(&clean_process, &leak_packet);
     assert_eq!(decision.verdict, Verdict::Drop);
-    assert_eq!(decision.error_code, Some(CognitiveErrorCode::EpermSemanticExfiltration));
+    assert_eq!(
+        decision.error_code,
+        Some(CognitiveErrorCode::EpermSemanticExfiltration)
+    );
     assert_eq!(decision.step_failed, Some(3));
 }
 
@@ -187,7 +202,10 @@ fn test_msac_step3_gatekeeper_prompt_injection_drop() {
 
     let decision = firewall.inspect_egress(&clean_process, &attack_packet);
     assert_eq!(decision.verdict, Verdict::Drop);
-    assert_eq!(decision.error_code, Some(CognitiveErrorCode::EpermPromptInjection));
+    assert_eq!(
+        decision.error_code,
+        Some(CognitiveErrorCode::EpermPromptInjection)
+    );
     assert_eq!(decision.step_failed, Some(3));
 }
 

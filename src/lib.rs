@@ -10,6 +10,7 @@
 
 pub mod governance;
 pub mod ipdu;
+pub mod transport;
 
 // Re-exportaciones principales
 pub use governance::{
@@ -20,3 +21,4 @@ pub use ipdu::{
     validate_frame_bounds, CognitivePolicyFlags, IpduError, IpduHeader, IpduPacket, Performative,
     CANONICAL_HEADER_SIZE, COMPACT_256BIT_HEADER_SIZE, ILP_VERSION_1, MAX_ILP_PAYLOAD_SIZE,
 };
+pub use transport::IlpStream;

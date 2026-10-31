@@ -120,6 +120,7 @@ impl IpduPacket {
     }
 
     /// Crea un paquete `PROPOSE_INTENT` con presupuesto y condiciones de contorno.
+    #[allow(clippy::too_many_arguments)]
     pub fn propose_intent(
         skill_hash: u64,
         session_uuid: u64,

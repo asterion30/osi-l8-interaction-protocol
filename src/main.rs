@@ -73,18 +73,37 @@ fn main() {
     println!("• Objeto Cabecera: {}", packet.header);
     println!("• Desglose de Bits en Word 0 (32 bits):");
     let word0 = packet.header.pack_word0();
-    println!("   - Raw Word 0:            0x{:08X} (Bits: {:032b})", word0, word0);
+    println!(
+        "   - Raw Word 0:            0x{:08X} (Bits: {:032b})",
+        word0, word0
+    );
     println!("   - VER (Bits 0..3):       0x{:X}", packet.header.version);
-    println!("   - PERF (Bits 4..9):      {} (0x{:02X})", packet.header.performative, packet.header.performative.as_u8());
-    println!("   - TIER (Bits 10..15):    {}", packet.header.autonomy_tier);
-    println!("   - FLAGS (Bits 16..31):   {} (0x{:04X})", packet.header.policy_flags, packet.header.policy_flags.bits());
-    println!("\n• Hexdump del Paquete Completo ({} bytes en el cable):", wire_bytes.len());
+    println!(
+        "   - PERF (Bits 4..9):      {} (0x{:02X})",
+        packet.header.performative,
+        packet.header.performative.as_u8()
+    );
+    println!(
+        "   - TIER (Bits 10..15):    {}",
+        packet.header.autonomy_tier
+    );
+    println!(
+        "   - FLAGS (Bits 16..31):   {} (0x{:04X})",
+        packet.header.policy_flags,
+        packet.header.policy_flags.bits()
+    );
+    println!(
+        "\n• Hexdump del Paquete Completo ({} bytes en el cable):",
+        wire_bytes.len()
+    );
     format_hexdump(&wire_bytes);
 
     // Verificación de deserialización bidireccional
     let decoded = IpduPacket::from_bytes(&wire_bytes).expect("Deserialización exitosa");
     assert_eq!(packet, decoded);
-    println!("\n  ✓ Deserialización bidireccional (Roundtrip) validada: 100% integridad bit-a-bit.\n");
+    println!(
+        "\n  ✓ Deserialización bidireccional (Roundtrip) validada: 100% integridad bit-a-bit.\n"
+    );
 
     // =========================================================================
     // PARTE 2: Cognitive Reference Monitor (MSAC Firewall) en Acción
@@ -167,7 +186,9 @@ fn main() {
     print_decision("CASO E", &decision_e);
 
     // --- Caso F: SLM Gatekeeper - Intento de Cross-Agent Prompt Injection (Paso 3 MSAC) ---
-    println!("► CASO F: Inyección adversaria para secuestrar el razonamiento de otro agente (Paso 3)");
+    println!(
+        "► CASO F: Inyección adversaria para secuestrar el razonamiento de otro agente (Paso 3)"
+    );
     let injection_packet = IpduPacket::propose_intent(
         skill_hash,
         session_uuid,
@@ -204,7 +225,10 @@ fn main() {
             record.pid,
             record.agent_name,
             err,
-            record.step_failed.map(|s| s.to_string()).unwrap_or_else(|| "-".to_string()),
+            record
+                .step_failed
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             record.reason
         );
     }
@@ -221,8 +245,14 @@ fn print_decision(tag: &str, decision: &ilp_core::governance::FilterDecision) {
         Verdict::Drop => {
             println!("   🔴 [{}] VEREDICTO: KERNEL DROP", tag);
             println!("      Código: {}", decision.error_code.as_ref().unwrap());
-            println!("      Paso:   Paso {} de 3 (MSAC)", decision.step_failed.unwrap_or(0));
-            println!("      Motivo: {}\n", decision.reason.as_deref().unwrap_or(""));
+            println!(
+                "      Paso:   Paso {} de 3 (MSAC)",
+                decision.step_failed.unwrap_or(0)
+            );
+            println!(
+                "      Motivo: {}\n",
+                decision.reason.as_deref().unwrap_or("")
+            );
         }
     }
 }

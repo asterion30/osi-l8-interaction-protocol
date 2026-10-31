@@ -1,10 +1,10 @@
 //! RFC-ILP-2026: Cognitive Reference Monitor (CRM) & Mandatory Semantic Access Control (MSAC) Firewall
 
-use crate::ipdu::flags::CognitivePolicyFlags;
-use crate::ipdu::packet::IpduPacket;
 use crate::governance::gatekeeper::{GatekeeperThreat, SlmGatekeeper};
 use crate::governance::policy::UserGovernancePolicy;
 use crate::governance::taint::{ProcessTaintContext, TaintTag};
+use crate::ipdu::flags::CognitivePolicyFlags;
+use crate::ipdu::packet::IpduPacket;
 use std::collections::VecDeque;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,13 +34,28 @@ impl fmt::Display for CognitiveErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EpermCognitivePolicy => write!(f, "EPERM_COGNITIVE_POLICY (Kernel Drop)"),
-            Self::EpermAutonomyExceeded => write!(f, "EPERM_AUTONOMY_EXCEEDED (Techo de autonomía violado)"),
-            Self::EpermBudgetExceeded => write!(f, "EPERM_BUDGET_EXCEEDED (Límite presupuestario superado)"),
-            Self::EpermInvalidDeadline => write!(f, "EPERM_INVALID_DEADLINE (TTL fuera de límites)"),
-            Self::EpermForbiddenSkill => write!(f, "EPERM_FORBIDDEN_SKILL (Habilidad no autorizada)"),
-            Self::EpermSandboxRequired => write!(f, "EPERM_SANDBOX_REQUIRED (Requiere flag REQUIRE_SANDBOXED_INFERENCE)"),
-            Self::EpermSemanticExfiltration => write!(f, "EPERM_SEMANTIC_EXFILTRATION (Fuga detectada por SLM)"),
-            Self::EpermPromptInjection => write!(f, "EPERM_PROMPT_INJECTION (Intento de evasión adversarial)"),
+            Self::EpermAutonomyExceeded => {
+                write!(f, "EPERM_AUTONOMY_EXCEEDED (Techo de autonomía violado)")
+            }
+            Self::EpermBudgetExceeded => {
+                write!(f, "EPERM_BUDGET_EXCEEDED (Límite presupuestario superado)")
+            }
+            Self::EpermInvalidDeadline => {
+                write!(f, "EPERM_INVALID_DEADLINE (TTL fuera de límites)")
+            }
+            Self::EpermForbiddenSkill => {
+                write!(f, "EPERM_FORBIDDEN_SKILL (Habilidad no autorizada)")
+            }
+            Self::EpermSandboxRequired => write!(
+                f,
+                "EPERM_SANDBOX_REQUIRED (Requiere flag REQUIRE_SANDBOXED_INFERENCE)"
+            ),
+            Self::EpermSemanticExfiltration => {
+                write!(f, "EPERM_SEMANTIC_EXFILTRATION (Fuga detectada por SLM)")
+            }
+            Self::EpermPromptInjection => {
+                write!(f, "EPERM_PROMPT_INJECTION (Intento de evasión adversarial)")
+            }
         }
     }
 }
@@ -323,6 +338,7 @@ impl CognitiveFirewall {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_drop(
         &mut self,
         now_ms: u64,

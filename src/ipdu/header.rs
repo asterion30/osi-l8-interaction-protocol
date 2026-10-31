@@ -38,6 +38,7 @@ pub struct IpduHeader {
 
 impl IpduHeader {
     /// Crea una nueva cabecera I-PDU con valores validados.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         performative: Performative,
         autonomy_tier: u8,
@@ -76,7 +77,9 @@ impl IpduHeader {
     }
 
     /// Desempaqueta los primeros 32 bits (Word 0).
-    pub fn unpack_word0(word0: u32) -> Result<(u8, Performative, u8, CognitivePolicyFlags), IpduError> {
+    pub fn unpack_word0(
+        word0: u32,
+    ) -> Result<(u8, Performative, u8, CognitivePolicyFlags), IpduError> {
         let version = ((word0 >> 28) & 0x0F) as u8;
         if version != ILP_VERSION_1 {
             return Err(IpduError::UnsupportedVersion(version));
@@ -217,6 +220,8 @@ pub enum IpduError {
     PayloadTooLarge(usize),
     ArithmeticOverflow,
     TruncatedPayload { expected: usize, actual: usize },
+    Io(String),
+    ConnectionClosed,
 }
 
 impl From<PerformativeError> for IpduError {
@@ -225,27 +230,60 @@ impl From<PerformativeError> for IpduError {
     }
 }
 
+impl From<std::io::Error> for IpduError {
+    fn from(err: std::io::Error) -> Self {
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            Self::ConnectionClosed
+        } else {
+            Self::Io(err.to_string())
+        }
+    }
+}
+
 impl fmt::Display for IpduError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedVersion(v) => write!(f, "Versión ILP no soportada: 0x{:X}", v),
-            Self::InvalidAutonomyTier(t) => write!(f, "Autonomy Tier fuera de rango (0..63): {}", t),
+            Self::InvalidAutonomyTier(t) => {
+                write!(f, "Autonomy Tier fuera de rango (0..63): {}", t)
+            }
             Self::Performative(e) => write!(f, "Error en performativa: {}", e),
             Self::BufferUnderflow { expected, actual } => {
-                write!(f, "Búfer insuficiente: esperado {} bytes, recibidos {}", expected, actual)
+                write!(
+                    f,
+                    "Búfer insuficiente: esperado {} bytes, recibidos {}",
+                    expected, actual
+                )
             }
             Self::InvalidPayloadLength { declared, actual } => {
-                write!(f, "Longitud de payload inconsistente: declarada {}, real {}", declared, actual)
+                write!(
+                    f,
+                    "Longitud de payload inconsistente: declarada {}, real {}",
+                    declared, actual
+                )
             }
             Self::PayloadTooLarge(len) => {
-                write!(f, "Payload excede el límite máximo de protocolo ({} bytes)", len)
+                write!(
+                    f,
+                    "Payload excede el límite máximo de protocolo ({} bytes)",
+                    len
+                )
             }
             Self::ArithmeticOverflow => {
-                write!(f, "Desbordamiento aritmético al calcular la longitud total de trama")
+                write!(
+                    f,
+                    "Desbordamiento aritmético al calcular la longitud total de trama"
+                )
             }
             Self::TruncatedPayload { expected, actual } => {
-                write!(f, "Trama truncada: esperado {} bytes totales, recibidos {}", expected, actual)
+                write!(
+                    f,
+                    "Trama truncada: esperado {} bytes totales, recibidos {}",
+                    expected, actual
+                )
             }
+            Self::Io(msg) => write!(f, "Error de E/S de transporte: {}", msg),
+            Self::ConnectionClosed => write!(f, "Conexión de transporte cerrada por el par remoto"),
         }
     }
 }

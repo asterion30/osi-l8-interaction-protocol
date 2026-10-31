@@ -105,7 +105,10 @@ fn test_complete_packet_roundtrip() {
 
     let decoded = IpduPacket::from_bytes(&wire).expect("Successful wire unpack");
     assert_eq!(packet, decoded);
-    assert_eq!(decoded.payload_as_str().unwrap(), "{\"intent\": \"convert_cad_to_gcode\", \"precision_mm\": 0.05}");
+    assert_eq!(
+        decoded.payload_as_str().unwrap(),
+        "{\"intent\": \"convert_cad_to_gcode\", \"precision_mm\": 0.05}"
+    );
 }
 
 #[test]
@@ -139,7 +142,9 @@ fn test_validate_frame_bounds_allocation_bomb_defense() {
     buf[CANONICAL_HEADER_SIZE..CANONICAL_HEADER_SIZE + 4].copy_from_slice(&bad_len.to_be_bytes());
 
     let res = validate_frame_bounds(&buf);
-    assert!(matches!(res, Err(IpduError::PayloadTooLarge(len)) if len == (MAX_ILP_PAYLOAD_SIZE + 1)));
+    assert!(
+        matches!(res, Err(IpduError::PayloadTooLarge(len)) if len == (MAX_ILP_PAYLOAD_SIZE + 1))
+    );
 
     // También verificamos que from_bytes rechace el paquete sin asignar memoria
     let packet_res = IpduPacket::from_bytes(&buf);
@@ -153,7 +158,8 @@ fn test_validate_frame_bounds_truncated_payload() {
     let mut buf = vec![0u8; CANONICAL_HEADER_SIZE + 4 + 10];
     // Declaramos 100 bytes de payload pero el búfer solo contiene 10
     let declared_len: u32 = 100;
-    buf[CANONICAL_HEADER_SIZE..CANONICAL_HEADER_SIZE + 4].copy_from_slice(&declared_len.to_be_bytes());
+    buf[CANONICAL_HEADER_SIZE..CANONICAL_HEADER_SIZE + 4]
+        .copy_from_slice(&declared_len.to_be_bytes());
 
     let res = validate_frame_bounds(&buf);
     assert!(matches!(
@@ -164,4 +170,3 @@ fn test_validate_frame_bounds_truncated_payload() {
         })
     ));
 }
-

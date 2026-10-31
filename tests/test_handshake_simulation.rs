@@ -28,7 +28,10 @@ fn test_full_3way_intent_handshake() {
         CognitivePolicyFlags::ALLOW_DELEGATION,
         "query: convert stl cad mesh to Haas 5-axis G-Code",
     );
-    assert_eq!(pdu_discover.header.performative, Performative::DiscoverSkill);
+    assert_eq!(
+        pdu_discover.header.performative,
+        Performative::DiscoverSkill
+    );
     let dec1 = firewall_a.inspect_egress(&client_proc, &pdu_discover);
     assert_eq!(dec1.verdict, Verdict::Allow);
 
