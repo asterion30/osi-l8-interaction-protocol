@@ -1,0 +1,11 @@
+//! RFC-ILP-2026: Interoperability Bridge Module
+//!
+//! Proporciona adaptadores de traducción e interoperabilidad entre el protocolo binario ILP
+//! de Capa 8 y estándares de la industria como Model Context Protocol (MCP) y A2A.
+
+pub mod mcp_adapter;
+
+pub use mcp_adapter::{fnv1a_64, McpBridge};
+
+#[cfg(feature = "mcp")]
+pub use mcp_adapter::{McpRpcRequest, McpRpcResponse};

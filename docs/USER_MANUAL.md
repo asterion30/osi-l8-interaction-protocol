@@ -177,7 +177,46 @@ def agent_egress_hook(tool_call):
 ```
 
 ### Entorno E: Adaptador para Model Context Protocol (MCP) de Anthropic
-En la Fase 2, se integra un proxy adaptador que toma tramas JSON-RPC de MCP (`tools/call`, `prompts/get`), calcula su huella hash y las encapsula en una I-PDU de Capa 8. Esto permite que herramientas estándar de Claude Desktop o Cursor queden protegidas contra prompt injection y fugas de datos sin modificar las herramientas MCP existentes.
+El módulo `ilp_core::bridge` permite proteger llamadas MCP JSON-RPC (`tools/call`, `prompts/get`) activando el feature opcional `mcp`:
+
+```rust
+use ilp_core::bridge::{McpBridge, McpRpcRequest};
+use ilp_core::governance::Verdict;
+
+// 1. Recibir llamada JSON-RPC del cliente MCP (Claude Desktop, etc.)
+let rpc_call = McpRpcRequest::new_tool_call(
+    "call-01",
+    "database_query",
+    serde_json::json!({"sql": "SELECT * FROM analytics"}),
+);
+
+// 2. Encapsular y auditar en sub-microsegundos con el MSAC
+let (packet, decision) = McpBridge::inspect_and_wrap(
+    &mut firewall,
+    &taint_context,
+    &rpc_call,
+    session_uuid,
+    100, // Presupuesto máximo
+    5_000,
+)?;
+
+if decision.verdict == Verdict::Allow {
+    stream.send_packet(&packet)?; // Transmitir trama I-PDU segura
+} else {
+    eprintln!("⛔ Bloqueo en el borde: {:?}", decision.reason);
+}
+```
+
+Para probar el demo interactivo del escudo MCP:
+```bash
+cargo run --example mcp_shield_demo --features mcp
+```
+
+### Entorno F: Medición de Latencia y Micro-Benchmarks
+Para reproducir las métricas de rendimiento en tu propia infraestructura sobre 100,000 iteraciones:
+```bash
+cargo run --release --example benchmark_latency
+```
 
 ---
 

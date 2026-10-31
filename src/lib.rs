@@ -8,11 +8,17 @@
 //! 2. **Módulo `governance`**: Cognitive Reference Monitor (CRM) y mecanismo
 //!    Mandatory Semantic Access Control (MSAC) con Taint Tracking, reglas declarativas y SLM Gatekeeper.
 
+pub mod bridge;
 pub mod governance;
 pub mod ipdu;
 pub mod transport;
 
 // Re-exportaciones principales
+#[cfg(not(feature = "mcp"))]
+pub use bridge::McpBridge;
+#[cfg(feature = "mcp")]
+pub use bridge::{McpBridge, McpRpcRequest, McpRpcResponse};
+
 pub use governance::{
     AuditRecord, CognitiveErrorCode, CognitiveFirewall, FilterDecision, ProcessTaintContext,
     TaintTag, UserGovernancePolicy, Verdict, DEFAULT_MAX_AUDIT_LOG_CAPACITY,

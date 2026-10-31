@@ -8,3 +8,9 @@ license = "MIT"
 
 [dependencies]
 # Standard library first design: zero external dependencies required for core wire protocol and MSAC firewall!
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"], optional = true }
+
+[features]
+default = []
+mcp = ["dep:serde", "dep:serde_json"]

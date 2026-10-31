@@ -1,0 +1,62 @@
+name: CI & Governance Verification
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  format-and-lint:
+    name: Code Formatting & Clippy Lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rustfmt Check
+        run: cargo fmt --check
+
+      - name: Clippy Analysis (All Features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test-suite:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Core Tests (Zero Dependencies)
+        run: cargo test --verbose
+
+      - name: Run All Tests (Including MCP Feature)
+        run: cargo test --all-features --verbose
+
+  examples-verification:
+    name: Live Demos & Micro-Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Live TCP Agent Proxy Demo
+        run: cargo run --example live_agent_proxy
+
+      - name: Run MCP Governance Shield Demo
+        run: cargo run --example mcp_shield_demo --features mcp
+
+      - name: Run Release Latency Micro-Benchmark
+        run: cargo run --release --example benchmark_latency
