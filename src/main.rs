@@ -70,27 +70,30 @@ fn main() {
     let wire_bytes = packet.to_bytes();
     let _header_bytes = &wire_bytes[0..CANONICAL_HEADER_SIZE];
 
-    println!("• Objeto Cabecera: {}", packet.header);
+    println!("• Objeto Cabecera: {}", packet.header());
     println!("• Desglose de Bits en Word 0 (32 bits):");
-    let word0 = packet.header.pack_word0();
+    let word0 = packet.header().pack_word0();
     println!(
         "   - Raw Word 0:            0x{:08X} (Bits: {:032b})",
         word0, word0
     );
-    println!("   - VER (Bits 0..3):       0x{:X}", packet.header.version);
+    println!(
+        "   - VER (Bits 0..3):       0x{:X}",
+        packet.header().version
+    );
     println!(
         "   - PERF (Bits 4..9):      {} (0x{:02X})",
-        packet.header.performative,
-        packet.header.performative.as_u8()
+        packet.header().performative,
+        packet.header().performative.as_u8()
     );
     println!(
         "   - TIER (Bits 10..15):    {}",
-        packet.header.autonomy_tier
+        packet.header().autonomy_tier
     );
     println!(
         "   - FLAGS (Bits 16..31):   {} (0x{:04X})",
-        packet.header.policy_flags,
-        packet.header.policy_flags.bits()
+        packet.header().policy_flags,
+        packet.header().policy_flags.bits()
     );
     println!(
         "\n• Hexdump del Paquete Completo ({} bytes en el cable):",

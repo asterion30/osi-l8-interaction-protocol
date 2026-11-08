@@ -17,6 +17,7 @@ use crate::ipdu::header::{IpduError, IpduHeader, CANONICAL_HEADER_SIZE};
 use crate::ipdu::packet::{IpduPacket, MAX_ILP_PAYLOAD_SIZE};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 /// Stream de comunicación de Capa 8 que serializa y deserializa paquetes `IpduPacket`
 /// directamente sobre un canal de transmisión subyacente.
@@ -55,13 +56,23 @@ impl IlpStream<TcpStream> {
     }
 }
 
+impl<S: SetSocketTimeout> IlpStream<S> {
+    /// Configura el tiempo límite de lectura y escritura sobre el stream subyacente.
+    pub fn set_io_timeout(&self, dur: Option<Duration>) -> Result<(), IpduError> {
+        self.inner.set_read_timeout(dur)?;
+        self.inner.set_write_timeout(dur)?;
+        Ok(())
+    }
+}
+
 impl<S: Read + Write> IlpStream<S> {
     /// Envía un paquete I-PDU completo a través del stream.
     ///
+    /// Valida previamente que el payload no supere 64 KiB mediante `packet.try_to_bytes()?`.
     /// Formato transmitido en red:
     /// `[36 bytes Header Canónico] [4 bytes Payload Length Big-Endian] [N bytes Payload]`
     pub fn send_packet(&mut self, packet: &IpduPacket) -> Result<(), IpduError> {
-        let wire_bytes = packet.to_bytes();
+        let wire_bytes = packet.try_to_bytes()?;
         self.inner.write_all(&wire_bytes)?;
         self.inner.flush()?;
         Ok(())
@@ -119,6 +130,6 @@ impl<S: Read + Write> IlpStream<S> {
             })?;
         }
 
-        Ok(IpduPacket::new(header, payload))
+        IpduPacket::try_new(header, payload)
     }
 }

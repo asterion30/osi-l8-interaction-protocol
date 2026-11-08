@@ -61,7 +61,7 @@ fn run_provider_server(listener: TcpListener, running: Arc<AtomicBool>, start: I
                     }
                     match stream.recv_packet() {
                         Ok(packet) => {
-                            let perf = packet.header.performative;
+                            let perf = packet.header().performative;
                             log_trace(
                                 "Agent-B (Provider)",
                                 start,
@@ -76,8 +76,8 @@ fn run_provider_server(listener: TcpListener, running: Arc<AtomicBool>, start: I
                                 "DISCOVER_SKILL" => {
                                     // Responder con PROPOSE_INTENT
                                     let resp = IpduPacket::propose_intent(
-                                        packet.header.skill_namespace_hash,
-                                        packet.header.session_uuid,
+                                        packet.header().skill_namespace_hash,
+                                        packet.header().session_uuid,
                                         1,
                                         150,
                                         10_000,
@@ -104,8 +104,8 @@ fn run_provider_server(listener: TcpListener, running: Arc<AtomicBool>, start: I
                                 "COUNTER_OFFER" => {
                                     // Aceptar y confirmar COMMIT_CONTRACT
                                     let commit = IpduPacket::commit_contract(
-                                        packet.header.session_uuid,
-                                        packet.header.skill_namespace_hash,
+                                        packet.header().session_uuid,
+                                        packet.header().skill_namespace_hash,
                                         120, // Acepta la contraoferta
                                         0xDEAD_BEEF_CAFE_0001,
                                         r#"{"escrow_state":"LOCKED","max_tokens":120,"contract_id":"CTR-9041"}"#,
@@ -237,7 +237,8 @@ impl AgentEgressProxy {
             start,
             &format!(
                 "✅ MSAC PASS ({} ns) -> Transmitiendo paquete {} a socket TCP...",
-                inspection_time_ns, packet.header.performative
+                inspection_time_ns,
+                packet.header().performative
             ),
         );
 
@@ -331,7 +332,8 @@ fn main() {
         start,
         &format!(
             "TCP RECV <- Oferta recibida: {} (Costo propuesto: {} tokens)",
-            propose_resp.header.performative, propose_resp.header.max_budget_cap
+            propose_resp.header().performative,
+            propose_resp.header().max_budget_cap
         ),
     );
 
@@ -356,7 +358,7 @@ fn main() {
         start,
         &format!(
             "TCP RECV <- Contrato sellado: {} | Payload: {}",
-            commit_resp.header.performative,
+            commit_resp.header().performative,
             commit_resp.payload_as_str().unwrap()
         ),
     );

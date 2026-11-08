@@ -66,10 +66,7 @@ fuzz_target!(|input: FuzzMsacInput| {
         input.payload
     };
 
-    let packet = IpduPacket {
-        header: header.clone(),
-        payload: bounded_payload,
-    };
+    let packet = IpduPacket::new(header.clone(), bounded_payload);
 
     // 2. Preparar el contexto de tinte monotónico del proceso
     let mut process_ctx = ProcessTaintContext::new(4242, "fuzz-worker-agent", true);

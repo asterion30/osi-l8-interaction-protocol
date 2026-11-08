@@ -4,8 +4,11 @@
 //! de Capa 8 y estándares de la industria como Model Context Protocol (MCP) y A2A.
 
 pub mod mcp_adapter;
+pub mod proxy;
 
 pub use mcp_adapter::{fnv1a_64, McpBridge, McpBridgeError};
 
 #[cfg(feature = "mcp")]
-pub use mcp_adapter::{McpRpcRequest, McpRpcResponse};
+pub use mcp_adapter::{McpRpcRequest, McpRpcResponse, McpSessionCorrelationTable};
+#[cfg(feature = "mcp")]
+pub use proxy::{ClientIngressResult, IlpMcpGateway, McpProxyRelay};

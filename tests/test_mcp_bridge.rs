@@ -37,14 +37,14 @@ fn test_mcp_tool_call_encapsulation_and_decapsulation() {
     let packet =
         McpBridge::encapsulate_request(&req, budget_cap, ttl_ms).expect("Encapsular llamada MCP");
 
-    assert_eq!(packet.header.performative, Performative::ProposeIntent);
+    assert_eq!(packet.header().performative, Performative::ProposeIntent);
     let expected_session_uuid = McpBridge::derive_session_uuid(&req.id);
-    assert_eq!(packet.header.session_uuid, expected_session_uuid);
-    assert_eq!(packet.header.max_budget_cap, budget_cap);
-    assert_eq!(packet.header.deadline_ttl_ms, ttl_ms);
+    assert_eq!(packet.header().session_uuid, expected_session_uuid);
+    assert_eq!(packet.header().max_budget_cap, budget_cap);
+    assert_eq!(packet.header().deadline_ttl_ms, ttl_ms);
 
     let expected_hash = fnv1a_64(b"tools/call:calculate_risk_score");
-    assert_eq!(packet.header.skill_namespace_hash, expected_hash);
+    assert_eq!(packet.header().skill_namespace_hash, expected_hash);
 
     let decoded_req = McpBridge::decapsulate_request(&packet).expect("Desencapsular llamada MCP");
 
@@ -70,10 +70,10 @@ fn test_mcp_response_encapsulation_and_decapsulation() {
     let packet = McpBridge::encapsulate_response(&resp, skill_hash, budget_spent)
         .expect("Encapsular respuesta MCP exitosa");
 
-    assert_eq!(packet.header.performative, Performative::AttestResult);
-    assert_eq!(packet.header.max_budget_cap, budget_spent);
+    assert_eq!(packet.header().performative, Performative::AttestResult);
+    assert_eq!(packet.header().max_budget_cap, budget_spent);
     assert_eq!(
-        packet.header.session_uuid,
+        packet.header().session_uuid,
         McpBridge::derive_session_uuid(&resp.id)
     );
 
@@ -98,7 +98,7 @@ fn test_mcp_response_error_encapsulation() {
     let packet = McpBridge::encapsulate_response(&resp, skill_hash, 0)
         .expect("Encapsular respuesta de error MCP");
 
-    assert_eq!(packet.header.performative, Performative::RejectPolicy);
+    assert_eq!(packet.header().performative, Performative::RejectPolicy);
 }
 
 #[test]

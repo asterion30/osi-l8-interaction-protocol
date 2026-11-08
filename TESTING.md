@@ -9,13 +9,13 @@ Este documento detalla la metodología, cobertura y resultados de la suite de pr
 | Módulo Evaluado | Archivo de Test | Pruebas | Resultado | Cobertura Funcional |
 | :--- | :--- | :---: | :---: | :--- |
 | **I-PDU Wire Format** | `tests/test_ipdu_wire.rs` | 9 | **100% PASS** | Empaquetado binario Big-Endian, Word 0 bitfields, cabecera canónica (36B), cabecera compacta (32B), defensa anti Allocation Bomb, rechazo estricto de bytes sobrantes (`TrailingBytes`) y bounds checking. |
-| **Cognitive Firewall (MSAC)** | `tests/test_firewall_msac.rs` | 13 | **100% PASS** | Pipeline MSAC de 3 pasos: Taint Tracking monotónico con encapsulamiento estricto, parser declarativo `.conf` con rechazo de duplicados y límites de tier (<= 63), límites O(1), DLP/Prompt Injection y Ring Buffer acotado. |
-| **Transport Session & FSM** | `tests/test_transport_fsm.rs` | 5 | **100% PASS** | Máquina de estados finita por roles (`SessionRole::Initiator` vs `SessionRole::Responder`), mutación atómica post-E/S, verificación estricta de `session_uuid`, plazos monotónicos con `Instant` y mapeo nativo de `ErrorKind`. |
+| **Cognitive Firewall (MSAC)** | `tests/test_firewall_msac.rs` | 14 | **100% PASS** | Pipeline MSAC de 3 pasos: Taint Tracking monotónico con encapsulamiento estricto, cobertura exhaustiva de todas las etiquetas sensibles (`ALL_SENSITIVE`), parser declarativo `.conf` con rechazo de duplicados y límites de tier (<= 63), límites O(1), DLP/Prompt Injection y Ring Buffer acotado. |
+| **Transport Session & FSM** | `tests/test_transport_fsm.rs` | 6 | **100% PASS** | Máquina de estados finita por roles (`SessionRole::Initiator` vs `SessionRole::Responder`), mutación atómica post-E/S, verificación estricta de `session_uuid`, plazos monotónicos dinámicos con `SetSocketTimeout`, y flujo completo de 5 pasos desde `DiscoverSkill` hasta `AttestResult` sobre TCP real. |
 | **TCP Sockets & Transport** | `tests/test_tcp_transport.rs` | 4 | **100% PASS** | Framing sobre streams TCP reales, contención de Allocation Bomb y serialización/deserialización en bucle. |
-| **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 7 | **100% PASS** | Mapeo estricto de llamadas MCP JSON-RPC (`tools/call` -> `ProposeIntent`, `tools/list` -> `DiscoverSkill`), respuestas (`AttestResult`/`RejectPolicy`), rechazo de métodos desconocidos (`UnsupportedMethod`) y derivación determinista de `session_uuid` con FNV-1a. |
-| **MCP Proxy E2E Enforcement** | `tests/test_mcp_proxy_e2e.rs` | 1 | **100% PASS** | Proxy TCP real que intercepta MCP JSON-RPC, encapsula en I-PDU y evalúa el firewall MSAC. **Demostración de No-Ejecución**: un contador atómico en el Mock Tool Server verifica que ante bloqueos (taint/prompt injection) la herramienta física jamás recibe tráfico. |
+| **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 7 | **100% PASS** | Mapeo estricto de llamadas MCP JSON-RPC (`tools/call` -> `ProposeIntent`, `tools/list` -> `DiscoverSkill`), respuestas (`AttestResult`/`RejectPolicy`), rechazo de métodos desconocidos (`UnsupportedMethod`) y tabla de correlación en memoria. |
+| **MCP Proxy E2E Enforcement** | `tests/test_mcp_proxy_e2e.rs` | 1 | **100% PASS** | Túnel 100% binario I-PDU sobre `IlpStream` (`IlpMcpGateway` + `McpProxyRelay`), interceptando llamadas MCP y evaluando el firewall MSAC. **Demostración de No-Ejecución**: ante bloqueos (taint/prompt injection) ningún byte sale al gateway y la herramienta física jamás recibe tráfico. |
 | **Protocol Handshake** | `tests/test_handshake_simulation.rs` | 1 | **100% PASS** | Negociación completa del 3-Way Intent Handshake entre Cliente y Proveedor con auditoría en ambos firewalls. |
-| **Total General** | **7 Suites de Tests** | **40** | **40 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
+| **Total General** | **7 Suites de Tests** | **42** | **42 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
 
 ---
 
@@ -83,6 +83,8 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
     - Comprueba el rechazo de sintaxis malformada sin `=` o con claves vacías.
 13. **`test_policy_from_conf_str_duplicate_keys_and_sandbox_tier_limits`**:
     - Comprueba el rechazo de claves escalares duplicadas y valores de `require_sandbox_above_tier > 63`.
+14. **`test_all_sensitive_taint_tags_trigger_drop_on_external_egress`**:
+    - Comprueba exhaustivamente que todas las 6 variantes sensibles (`MEDICAL_PII`, `FINANCIAL_DATA`, `BIOMETRIC_DATA`, `CREDENTIALS`, `GOVERNMENT_ID`, `CONFIDENTIAL_IP`) provoquen `Verdict::Drop` en egreso externo.
 
 ---
 
@@ -98,6 +100,8 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
    - Comprueba el cierre ordenado de sesión.
 5. **`test_fsm_tcp_read_timeout_expiration`**:
    - Comprueba que la expiración del plazo monotónico (`deadline_ttl_ms`) culmine en `IpduError::DeadlineExpired` y estado `Terminated(Timeout)`.
+6. **`test_full_5step_discovery_to_attest_flow`**:
+   - Valida el ciclo de vida completo de 5 pasos sobre sockets TCP reales: `DiscoverSkill` -> `DiscoverSkill` (anuncio) -> `ProposeIntent` -> `CounterOffer` -> `CommitContract` -> `AttestResult` -> `Terminated(Completed)`.
 
 ---
 
@@ -118,9 +122,10 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
 7. **`test_mcp_inspect_and_wrap_taint_drop`**:
    - Valida el bloqueo por tinte activo al envolver llamadas MCP.
 8. **`test_mcp_proxy_e2e_real_enforcement`**:
-   - Levanta un Mock MCP Tool Server sobre TCP con un contador atómico `executions`.
-   - Levanta un `IlpSidecarProxy` que intercepta llamadas MCP, evalúa el firewall MSAC y solo reenvía con `Verdict::Allow`.
-   - **Prueba de No-Ejecución**: ante llamadas bloqueadas (tinte médico o prompt injection), el contador del Mock Tool Server no se incrementa, garantizando que el servidor físico jamás ejecutó la herramienta.
+   - Levanta un `MockToolServer` sobre TCP para herramientas JSON-RPC.
+   - Levanta un `IlpGatewayServer` que recibe paquetes binarios `IpduPacket` vía `IlpStream` y los despacha al backend.
+   - Levanta un `IlpSidecarProxy` que intercepta llamadas MCP, evalúa el firewall MSAC y transmite 100% tramas binarias I-PDU hacia el gateway.
+   - **Prueba de No-Ejecución**: ante llamadas bloqueadas (tinte médico o prompt injection), ningún byte se emite al gateway y el contador atómico del servidor permanece inmutable.
 
 ---
 
@@ -142,5 +147,5 @@ cargo test --all-targets --all-features
 
 Salida esperada:
 ```text
-test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```

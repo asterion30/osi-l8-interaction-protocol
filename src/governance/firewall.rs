@@ -60,6 +60,23 @@ impl fmt::Display for CognitiveErrorCode {
     }
 }
 
+impl CognitiveErrorCode {
+    /// Retorna un código numérico estándar para el error (compatible con JSON-RPC / errno).
+    #[inline]
+    pub fn as_i32(&self) -> i32 {
+        match self {
+            Self::EpermCognitivePolicy => -32000,
+            Self::EpermAutonomyExceeded => -32001,
+            Self::EpermBudgetExceeded => -32002,
+            Self::EpermInvalidDeadline => -32003,
+            Self::EpermForbiddenSkill => -32004,
+            Self::EpermSandboxRequired => -32005,
+            Self::EpermSemanticExfiltration => -32006,
+            Self::EpermPromptInjection => -32007,
+        }
+    }
+}
+
 /// Veredicto formal emitido por el Firewall Cognitivo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -148,17 +165,14 @@ impl CognitiveFirewall {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let session_uuid = packet.header.session_uuid;
-        let perf_str = packet.header.performative.to_string();
+        let session_uuid = packet.header().session_uuid;
+        let perf_str = packet.header().performative.to_string();
 
         // =========================================================================
         // PASO 1: Auditoría de Tinte de Proceso vs Políticas de Privacidad (Sub-microsegundo)
         // =========================================================================
         if process.is_external_egress() && self.policy.deny_external_egress_if_tainted {
-            let critical_taint = TaintTag::MEDICAL_PII
-                | TaintTag::FINANCIAL_DATA
-                | TaintTag::CREDENTIALS
-                | TaintTag::GOVERNMENT_ID;
+            let critical_taint = TaintTag::ALL_SENSITIVE;
 
             if process.has_taint(critical_taint) {
                 let sources = process.format_taint_sources();
@@ -193,7 +207,7 @@ impl CognitiveFirewall {
         // =========================================================================
         // PASO 2: Evaluación Determinista de Cabecera Binaria y Reglas del Usuario (O(1))
         // =========================================================================
-        let header = &packet.header;
+        let header = packet.header();
 
         // 2.1 Límite de autonomía concedida
         if header.autonomy_tier > self.policy.max_autonomy_tier {
@@ -287,7 +301,7 @@ impl CognitiveFirewall {
         // =========================================================================
         // PASO 3: Guardián SLM Embebido: Inspección Profunda de Carga Útil (<5 ms)
         // =========================================================================
-        if let Err(threat) = self.gatekeeper.inspect(&packet.payload) {
+        if let Err(threat) = self.gatekeeper.inspect(packet.payload()) {
             let (err_code, reason) = match threat {
                 GatekeeperThreat::FinancialExfiltration(msg) => {
                     (CognitiveErrorCode::EpermSemanticExfiltration, msg)

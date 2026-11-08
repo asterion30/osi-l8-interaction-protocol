@@ -63,21 +63,22 @@ El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento
 - **Comando de Reproducción**: `./scripts/run_benchmarks.sh` o `cargo run --release --example benchmark_latency`.
 - **Informe Completo**: [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md).
 
+### Batch-Amortized Latency Distribution (1,000 batches × 100 ops/batch — ns/op)
+
 | Operación / Subsistema | Tamaño / Formato | Mediana (p50) | Percentil 95 (p95) | Percentil 99 (p99) | Máximo | Desviación Estándar (σ) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **I-PDU Header Parsing** | 36 Bytes (Canónico) | **26.9 ns** | 26.9 ns | 26.9 ns | 284.1 ns | ±8.1 ns |
-| **I-PDU Packet Wire Roundtrip** | 512B Payload | **112.6 ns** | 127.0 ns | 178.3 ns | 579.2 ns | ±25.9 ns |
-| **MSAC Semantic Firewall Egress** | 3 Pasos Completos | **908.6 ns** | 1.23 µs | 1.46 µs | 1.69 µs | ±120.2 ns |
-| **JSON-RPC String Scan (Baseline)** | 512B Texto Plano | **345.3 ns** | 372.1 ns | 557.6 ns | 903.0 ns | ±41.3 ns |
+| **I-PDU Header Parsing** | 36 Bytes (Canónico) | **26.9 ns** | 26.9 ns | 26.9 ns | 230.3 ns | ±6.4 ns |
+| **I-PDU Packet Wire Roundtrip** | 512B Payload | **112.6 ns** | 112.6 ns | 116.0 ns | 751.4 ns | ±21.7 ns |
+| **MSAC Semantic Firewall Egress** | 3 Pasos Completos | **933.1 ns** | 1224.5 ns | 1559.4 ns | 1718.7 ns | ±121.2 ns |
 
-> **Overhead Absoluto del Monitor en Espacio de Usuario (ns/op):** El parseo binario I-PDU insume ~27 ns/op, y el Firewall Cognitivo MSAC ejecuta su inspección en menos de un microsegundo (**p50 = 908.6 ns**), garantizando contención estricta sin penalizar los tiempos de inferencia de los LLMs.
+> **Nota metodológica:** Las latencias son promedios amortizados a través de lotes de 100 operaciones para eliminar el overhead de `clock_gettime` por vDSO (~15-25 ns). La latencia de invocación individual reflejará el piso del reloj del sistema operativo. El parseo binario I-PDU insume ~27 ns/op, y el Firewall Cognitivo MSAC ejecuta su inspección en menos de un microsegundo (**p50 = 933.1 ns**), garantizando contención estricta sin penalizar la inferencia de LLMs.
 
 ---
 
 ## 🚀 Inicio Rápido (Quickstart)
 
 ```bash
-# 1. Ejecutar la suite completa de 40 pruebas de integración y unitarias
+# 1. Ejecutar la suite completa de 42 pruebas de integración y unitarias
 cargo test --all-targets --all-features
 
 # 2. Correr el benchmark formal reproducible y generar docs/BENCHMARK_RESULTS.md
@@ -254,16 +255,16 @@ osi-l8-interaction-protocol/
 │   ├── transport/                                        # Capa de transporte y sesión con estado
 │   │   ├── mod.rs                                        # IlpStream sobre sockets TCP / Read+Write
 │   │   └── session.rs                                    # IlpSession y FSM de 3-Way Intent Handshake
-│   ├── bridge/                                           # Escudo de compatibilidad con MCP JSON-RPC
+│   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway)
 │   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 40 tests de integración y verificación E2E
+├── tests/                                                # 42 tests de integración y verificación E2E
 │   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking y simetría binaria (9 tests)
-│   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC (13 tests)
-│   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (5 tests)
+│   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC (14 tests)
+│   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (6 tests)
 │   ├── test_tcp_transport.rs                             # Sockets TCP reales y contención OOM (4 tests)
 │   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
 │   ├── test_mcp_bridge.rs                                # Mapeo estricto de métodos y error types (7 tests)
-│   └── test_mcp_proxy_e2e.rs                             # Proxy TCP E2E con prueba de no-ejecución (1 test)
+│   └── test_mcp_proxy_e2e.rs                             # Túnel binario I-PDU MCP E2E con no-ejecución (1 test)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
     ├── live_agent_proxy.rs                               # Comunicación en vivo entre 2 agentes por TCP

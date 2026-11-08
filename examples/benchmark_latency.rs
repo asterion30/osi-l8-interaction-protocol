@@ -130,7 +130,7 @@ fn main() {
     )
     .expect("Valid packet");
 
-    let header = sample_packet.header.clone();
+    let header = sample_packet.header().clone();
     let header_bytes = header.to_canonical_bytes();
 
     // B. Packet con payload de 512 bytes exactos
@@ -142,13 +142,6 @@ fn main() {
     let policy = UserGovernancePolicy::default();
     let mut firewall = CognitiveFirewall::new(policy);
     let taint_ctx = ProcessTaintContext::new(1001, "Benchmark-Worker", false);
-
-    // D. Baseline JSON-RPC payload equivalente de ~512 bytes
-    let json_rpc_str = format!(
-        r#"{{"jsonrpc":"2.0","id":1001,"method":"tools/call","params":{{"name":"cad_translation_service","budget":250,"ttl":10000,"flags":["REQUIRE_SANDBOXED_INFERENCE"],"payload":"{}"}}}}"#,
-        "X".repeat(340)
-    );
-    let json_rpc_bytes = json_rpc_str.as_bytes();
 
     // -------------------------------------------------------------------------
     // TEST 1: IpduHeader Canonical Roundtrip (to_canonical_bytes + from_canonical_bytes)
@@ -215,39 +208,9 @@ fn main() {
     let stats_firewall = compute_stats(samples_firewall);
 
     // -------------------------------------------------------------------------
-    // TEST 4: Baseline JSON-RPC Equivalent Manual Parsing (512B)
-    // -------------------------------------------------------------------------
-    fn parse_json_baseline(raw: &[u8]) -> (Option<usize>, Option<usize>) {
-        let s = match std::str::from_utf8(raw) {
-            Ok(val) => val,
-            Err(_) => return (None, None),
-        };
-        let method = s.find("\"method\":\"tools/call\"");
-        let params = s.find("\"params\":{");
-        (method, params)
-    }
-
-    for _ in 0..WARMUP_ITERATIONS {
-        let res = parse_json_baseline(json_rpc_bytes);
-        black_box(res);
-    }
-
-    let mut samples_json = Vec::with_capacity(BENCHMARK_SAMPLES);
-    for _ in 0..BENCHMARK_SAMPLES {
-        let t0 = Instant::now();
-        for _ in 0..BATCH_SIZE {
-            let res = parse_json_baseline(black_box(json_rpc_bytes));
-            black_box(res);
-        }
-        let elapsed_batch = t0.elapsed().as_nanos() as f64;
-        samples_json.push(elapsed_batch / (BATCH_SIZE as f64));
-    }
-    let stats_json = compute_stats(samples_json);
-
-    // -------------------------------------------------------------------------
     // STATISTICAL REPORT OUTPUT
     // -------------------------------------------------------------------------
-    println!(">>> OVERHEAD ABSOLUTO DEL MONITOR EN ESPACIO DE USUARIO (ns/op):\n");
+    println!(">>> Batch-Amortized Latency Distribution (1,000 batches × 100 ops/batch — ns/op):\n");
     println!(
         "{:<38} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7}",
         "Operation / Target", "Min", "p50", "p95", "p99", "Max", "Mean", "StdDev"
@@ -264,7 +227,6 @@ fn main() {
     print_row("1. I-PDU Header (36B Roundtrip)", &stats_header);
     print_row("2. I-PDU Packet (512B Wire Roundtrip)", &stats_packet);
     print_row("3. MSAC Firewall (3-Step Inspection)", &stats_firewall);
-    print_row("4. Baseline JSON-RPC (512B Scan)", &stats_json);
 
     println!("\n--------------------------------------------------------------------------------");
     println!(">>> RESUMEN ESTADÍSTICO PARA AUDITORÍA Y DOCUMENTACIÓN");
@@ -284,12 +246,8 @@ fn main() {
         "| **MSAC Semantic Firewall Egress** | Full 3 Steps | **{:.1} ns** | {:.1} ns | {:.1} ns | {:.1} ns | ±{:.1} ns |",
         stats_firewall.p50_ns, stats_firewall.p95_ns, stats_firewall.p99_ns, stats_firewall.max_ns, stats_firewall.std_dev_ns
     );
-    println!(
-        "| **JSON-RPC String Scan (Baseline)** | 512B Text | **{:.1} ns** | {:.1} ns | {:.1} ns | {:.1} ns | ±{:.1} ns |",
-        stats_json.p50_ns, stats_json.p95_ns, stats_json.p99_ns, stats_json.max_ns, stats_json.std_dev_ns
-    );
 
-    println!("\n📌 Nota metodológica: Mediciones amortizadas en lotes de {} operaciones para eliminar el artefacto del reloj (vDSO clock_gettime).", BATCH_SIZE);
+    println!("\n📌 Nota metodológica: Latencies are amortized averages across 100-operation batches to eliminate vDSO clock_gettime overhead (~15-25 ns). Individual single-op invocation latency will reflect the system clock floor.");
     println!("   Los valores reflejan el overhead neto por operación en espacio de usuario.");
     println!("✅ Benchmark finished successfully.");
 }

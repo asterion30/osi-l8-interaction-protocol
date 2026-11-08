@@ -3,7 +3,9 @@
 use ilp_core::ipdu::flags::CognitivePolicyFlags;
 use ilp_core::ipdu::header::IpduError;
 use ilp_core::ipdu::packet::IpduPacket;
-use ilp_core::transport::{IlpSession, IlpStream, SessionRole, SessionState, TerminationReason};
+use ilp_core::transport::{
+    IlpSession, IlpStream, SessionRole, SessionState, SetSocketTimeout, TerminationReason,
+};
 use std::io::{self, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -15,6 +17,8 @@ struct DuplexPipe {
     reader: mpsc::Receiver<u8>,
     writer: mpsc::Sender<u8>,
 }
+
+impl SetSocketTimeout for DuplexPipe {}
 
 impl DuplexPipe {
     fn pair() -> (Self, Self) {
@@ -287,6 +291,167 @@ fn test_fsm_clean_disconnect_termination() {
     assert_eq!(
         *session.state(),
         SessionState::Terminated(TerminationReason::PeerDisconnected)
+    );
+
+    server_handle.join().unwrap();
+}
+
+#[test]
+fn test_full_5step_discovery_to_attest_flow() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Bind ephemeral listener");
+    let addr = listener.local_addr().unwrap();
+    let session_uuid = 0x8888_9999_AAAA_BBBB;
+    let skill_hash = 0x1234_5678_9ABC_DEF0;
+
+    let server_handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("Accept TCP connection");
+        let mut session = IlpSession::with_session_uuid(
+            IlpStream::new(stream),
+            SessionRole::Responder,
+            session_uuid,
+        );
+
+        // 1. Responder espera DISCOVER_SKILL (pasa a DiscoverySent)
+        let disc_req = session
+            .recv_packet()
+            .expect("Responder receives DiscoverSkill");
+        assert_eq!(disc_req.header().performative.to_string(), "DISCOVER_SKILL");
+        assert_eq!(*session.state(), SessionState::DiscoverySent);
+
+        // 2. Responder responde con DISCOVER_SKILL anunciando capacidades (pasa/se mantiene en DiscoverySent)
+        let disc_resp = IpduPacket::discover_skill(
+            skill_hash,
+            session_uuid,
+            CognitivePolicyFlags::EMPTY,
+            r#"{"capabilities":["nlp_v2","summarize"]}"#,
+        );
+        session
+            .send_packet(&disc_resp)
+            .expect("Responder sends DiscoverSkill capabilities");
+        assert_eq!(*session.state(), SessionState::DiscoverySent);
+
+        // 3. Responder recibe PROPOSE_INTENT (pasa a IntentProposed)
+        let propose = session
+            .recv_packet()
+            .expect("Responder receives ProposeIntent");
+        assert_eq!(propose.header().performative.to_string(), "PROPOSE_INTENT");
+        assert_eq!(*session.state(), SessionState::IntentProposed);
+
+        // 4. Responder envía COUNTER_OFFER (pasa a CounterOffered)
+        let counter = IpduPacket::counter_offer(
+            session_uuid,
+            skill_hash,
+            120,
+            5000,
+            0xABCD,
+            r#"{"price":120}"#,
+        )
+        .expect("Build CounterOffer");
+        session
+            .send_packet(&counter)
+            .expect("Responder sends CounterOffer");
+        assert_eq!(*session.state(), SessionState::CounterOffered);
+
+        // 5. Responder recibe COMMIT_CONTRACT (pasa a ContractCommitted)
+        let commit = session
+            .recv_packet()
+            .expect("Responder receives CommitContract");
+        assert_eq!(commit.header().performative.to_string(), "COMMIT_CONTRACT");
+        assert_eq!(*session.state(), SessionState::ContractCommitted);
+
+        // 6. Responder envía ATTEST_RESULT (pasa a Terminated(Completed))
+        let attest = IpduPacket::attest_result(
+            session_uuid,
+            skill_hash,
+            1,
+            0xABCD,
+            r#"{"execution_proof":"zkp-verified"}"#,
+        )
+        .expect("Build AttestResult");
+        session
+            .send_packet(&attest)
+            .expect("Responder sends AttestResult");
+        assert_eq!(
+            *session.state(),
+            SessionState::Terminated(TerminationReason::Completed)
+        );
+    });
+
+    let tcp_client = TcpStream::connect(addr).expect("Connect client to server");
+    let mut session = IlpSession::with_session_uuid(
+        IlpStream::new(tcp_client),
+        SessionRole::Initiator,
+        session_uuid,
+    );
+
+    // 1. Initiator envía DISCOVER_SKILL (pasa a DiscoverySent)
+    let disc_req = IpduPacket::discover_skill(
+        skill_hash,
+        session_uuid,
+        CognitivePolicyFlags::EMPTY,
+        "query:nlp_v2",
+    );
+    session
+        .send_packet(&disc_req)
+        .expect("Initiator sends DiscoverSkill");
+    assert_eq!(*session.state(), SessionState::DiscoverySent);
+
+    // 2. Initiator recibe DISCOVER_SKILL del Responder (pasa/se mantiene en DiscoverySent)
+    let disc_resp = session
+        .recv_packet()
+        .expect("Initiator receives DiscoverSkill capabilities");
+    assert_eq!(
+        disc_resp.header().performative.to_string(),
+        "DISCOVER_SKILL"
+    );
+    assert_eq!(*session.state(), SessionState::DiscoverySent);
+
+    // 3. Initiator envía PROPOSE_INTENT (pasa a IntentProposed)
+    let propose = IpduPacket::propose_intent(
+        skill_hash,
+        session_uuid,
+        1,
+        150,
+        10_000,
+        CognitivePolicyFlags::REQUIRE_SANDBOXED_INFERENCE,
+        0x1234,
+        r#"{"task":"summarize"}"#,
+    )
+    .expect("Build ProposeIntent");
+    session
+        .send_packet(&propose)
+        .expect("Initiator sends ProposeIntent");
+    assert_eq!(*session.state(), SessionState::IntentProposed);
+
+    // 4. Initiator recibe COUNTER_OFFER (pasa a CounterOffered)
+    let counter = session
+        .recv_packet()
+        .expect("Initiator receives CounterOffer");
+    assert_eq!(counter.header().performative.to_string(), "COUNTER_OFFER");
+    assert_eq!(*session.state(), SessionState::CounterOffered);
+
+    // 5. Initiator envía COMMIT_CONTRACT (pasa a ContractCommitted)
+    let commit = IpduPacket::commit_contract(
+        session_uuid,
+        skill_hash,
+        120,
+        0x1234,
+        r#"{"locked_funds":120}"#,
+    )
+    .expect("Build CommitContract");
+    session
+        .send_packet(&commit)
+        .expect("Initiator sends CommitContract");
+    assert_eq!(*session.state(), SessionState::ContractCommitted);
+
+    // 6. Initiator recibe ATTEST_RESULT (pasa a Terminated(Completed))
+    let attest = session
+        .recv_packet()
+        .expect("Initiator receives AttestResult");
+    assert_eq!(attest.header().performative.to_string(), "ATTEST_RESULT");
+    assert_eq!(
+        *session.state(),
+        SessionState::Terminated(TerminationReason::Completed)
     );
 
     server_handle.join().unwrap();

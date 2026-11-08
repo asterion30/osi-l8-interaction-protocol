@@ -29,6 +29,26 @@ impl TaintTag {
     /// Bit 5: Propiedad Intelectual Confidencial o Código Propietario.
     pub const CONFIDENTIAL_IP: Self = Self(1 << 5);
 
+    /// Conjunto completo de todas las etiquetas sensibles sujetas a restricción estricta de egreso.
+    pub const ALL_SENSITIVE: Self = Self(
+        Self::MEDICAL_PII.0
+            | Self::FINANCIAL_DATA.0
+            | Self::BIOMETRIC_DATA.0
+            | Self::CREDENTIALS.0
+            | Self::GOVERNMENT_ID.0
+            | Self::CONFIDENTIAL_IP.0,
+    );
+
+    /// Array con todas las variantes sensibles individuales para auditorías e iteración exhaustiva.
+    pub const ALL_SENSITIVE_VARIANTS: [Self; 6] = [
+        Self::MEDICAL_PII,
+        Self::FINANCIAL_DATA,
+        Self::BIOMETRIC_DATA,
+        Self::CREDENTIALS,
+        Self::GOVERNMENT_ID,
+        Self::CONFIDENTIAL_IP,
+    ];
+
     #[inline]
     pub const fn from_bits(bits: u32) -> Self {
         Self(bits)

@@ -357,3 +357,42 @@ user_did = did:key:duplicate
     let err2 = UserGovernancePolicy::from_conf_str(bad_sandbox_conf).unwrap_err();
     assert!(err2.message.contains("excede el límite"));
 }
+
+#[test]
+fn test_all_sensitive_taint_tags_trigger_drop_on_external_egress() {
+    let policy = UserGovernancePolicy {
+        deny_external_egress_if_tainted: true,
+        ..Default::default()
+    };
+    let mut firewall = CognitiveFirewall::new(policy);
+
+    let packet = IpduPacket::propose_intent(
+        0x1234,
+        0xABCD,
+        1,
+        1_000,
+        5_000,
+        CognitivePolicyFlags::EMPTY,
+        0x9999,
+        "valid intent payload",
+    )
+    .unwrap();
+
+    for &tag in &TaintTag::ALL_SENSITIVE_VARIANTS {
+        let mut proc = ProcessTaintContext::new(888, "sensitive-worker", true);
+        proc.apply_taint(tag, "audit_source_verification");
+
+        let decision = firewall.inspect_egress(&proc, &packet);
+        assert_eq!(
+            decision.verdict,
+            Verdict::Drop,
+            "La etiqueta sensible {:?} DEBE disparar Verdict::Drop en egreso externo",
+            tag
+        );
+        assert_eq!(
+            decision.error_code,
+            Some(CognitiveErrorCode::EpermCognitivePolicy)
+        );
+        assert_eq!(decision.step_failed, Some(1));
+    }
+}

@@ -1,51 +1,48 @@
-//! RFC-ILP-2026: Stateful Session Management & Finite State Machine (FSM)
+//! RFC-ILP-2026: Transport Session & Handshake Finite State Machine (FSM)
 //!
-//! Este módulo formaliza la capa de sesión del protocolo ILP implementando una
-//! Máquina de Estados Finita (FSM) determinista por roles (Initiator vs Responder)
-//! sobre el transporte binario `IlpStream`.
-//!
-//! Garantiza:
-//! 1. Orden estricto de los actos de habla del 3-Way Intent Handshake por rol y dirección.
-//! 2. Mutación atómica de estado y session_uuid (solo tras I/O exitosa).
-//! 3. Aplicación de timeouts de red derivados del `deadline_ttl_ms` y monotonic deadlines con `Instant`.
-//! 4. Manejo estricto de desconexiones y eliminación de comparaciones de cadenas para errores de E/S.
+//! Este módulo formaliza la capa de sesión y negociación bilateral de Capa 8:
+//! 1. `IlpSession`: Gestor de sesión que gobierna el canal sobre cualquier `IlpStream`.
+//! 2. `SessionState`: Estados finitos formales del 3-Way Intent Handshake (RFC-ILP-2026).
+//! 3. `SessionRole`: Rol explícito en la negociación (`Initiator` o `Responder`), garantizando
+//!    que solo el iniciador abra propuestas y que el servidor no emita contratos no solicitados.
+//! 4. `TerminationReason`: Causa estricta de cierre de sesión (Completado, Rechazado, Timeout, Violación).
 
+use super::IlpStream;
 use crate::ipdu::header::IpduError;
 use crate::ipdu::packet::IpduPacket;
 use crate::ipdu::performatives::Performative;
-use crate::transport::IlpStream;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-/// Rol asignado al nodo dentro de la sesión ILP.
+/// Rol de la entidad en la sesión de negociación agéntica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRole {
-    /// Inicia la interacción (Cliente / Agente Solicitante).
+    /// Cliente / Agente demandante que inicia el descubrimiento o propone el objetivo.
     Initiator,
-    /// Responde a la interacción (Servidor / Agente Proveedor).
+    /// Servidor / Agente proveedor que escucha, cotiza o ejecuta la habilidad.
     Responder,
 }
 
-/// Causa de terminación o cierre de una sesión ILP.
+/// Razones de finalización y desconexión de una sesión de Capa 8.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminationReason {
-    /// Negociación y entrega de resultados completada exitosamente.
+    /// Negociación y ejecución completadas con éxito (`ATTEST_RESULT` confirmado).
     Completed,
-    /// El tiempo límite (deadline TTL) expiró antes de converger.
-    Timeout,
-    /// Violación de la secuencia de la máquina de estados o parámetros incompatibles.
-    ProtocolViolation(String),
-    /// La contraparte cerró la conexión TCP de forma ordenada o abrupta.
-    PeerDisconnected,
-    /// Interacción rechazada formalmente mediante `RejectPolicy`.
+    /// Rechazado por política de gobernanza o desacuerdo de términos (`REJECT_POLICY`).
     Rejected,
+    /// Tiempo límite (deadline TTL) expirado antes de completar la interacción.
+    Timeout,
+    /// Violación de protocolo (ej. performativa fuera de orden o inconsistencia de UUID).
+    ProtocolViolation(String),
+    /// Desconexión limpia del par remoto.
+    PeerDisconnected,
 }
 
-/// Estados formales de la Máquina de Estados Finita (FSM) de una sesión ILP.
+/// Estados finitos del 3-Way Intent Handshake (RFC-ILP-2026).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
-    /// Estado inicial: no hay negociación activa en el canal.
+    /// Canal establecido, listo para iniciar negociación.
     Idle,
     /// Se ha emitido o recibido una consulta de habilidades semánticas (`DiscoverSkill`).
     DiscoverySent,
@@ -84,10 +81,14 @@ enum Direction {
     Recv,
 }
 
-/// Helper trait opcional para configurar timeouts sobre streams que lo soporten (como `TcpStream`).
+/// Helper trait para configurar timeouts sobre streams que lo soporten (como `TcpStream`).
 pub trait SetSocketTimeout {
-    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()>;
-    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()>;
+    fn set_read_timeout(&self, _dur: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn set_write_timeout(&self, _dur: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl SetSocketTimeout for TcpStream {
@@ -99,6 +100,8 @@ impl SetSocketTimeout for TcpStream {
         TcpStream::set_write_timeout(self, dur)
     }
 }
+
+impl<T> SetSocketTimeout for std::io::Cursor<T> {}
 
 /// Gestor de sesión con estado que encapsula un `IlpStream` y gobierna la FSM.
 #[derive(Debug)]
@@ -261,6 +264,18 @@ impl<S> IlpSession<S> {
             (
                 SessionRole::Initiator,
                 Direction::Recv,
+                SessionState::DiscoverySent,
+                Performative::CounterOffer,
+            ) => Ok(SessionState::CounterOffered),
+            (
+                SessionRole::Initiator,
+                Direction::Recv,
+                SessionState::DiscoverySent,
+                Performative::ProposeIntent,
+            ) => Ok(SessionState::IntentProposed),
+            (
+                SessionRole::Initiator,
+                Direction::Recv,
                 SessionState::IntentProposed,
                 Performative::CounterOffer,
             ) => Ok(SessionState::CounterOffered),
@@ -334,6 +349,18 @@ impl<S> IlpSession<S> {
             (
                 SessionRole::Responder,
                 Direction::Send,
+                SessionState::DiscoverySent,
+                Performative::CounterOffer,
+            ) => Ok(SessionState::CounterOffered),
+            (
+                SessionRole::Responder,
+                Direction::Send,
+                SessionState::DiscoverySent,
+                Performative::ProposeIntent,
+            ) => Ok(SessionState::IntentProposed),
+            (
+                SessionRole::Responder,
+                Direction::Send,
                 SessionState::IntentProposed,
                 Performative::CounterOffer,
             ) => Ok(SessionState::CounterOffered),
@@ -358,68 +385,74 @@ impl<S> IlpSession<S> {
 
             // Combinación ilegal
             (role, dir, current_state, perf) => Err(IpduError::InvalidStateTransition {
-                current: format!("{:?} ({:?}, dir: {:?})", current_state, role, dir),
+                current: format!("{:?} ({:?} {:?})", current_state, role, dir),
                 received_performative: perf.to_string(),
             }),
         }
     }
 
-    /// Valida que el UUID de sesión del paquete coincida con la sesión activa sin mutar el estado.
+    /// Verifica si el `session_uuid` del paquete entrante o saliente coincide con el de la sesión.
     fn check_session_uuid(&self, pkt_uuid: u64) -> Result<u64, IpduError> {
-        if let Some(expected) = self.session_uuid {
-            if expected != pkt_uuid {
-                return Err(IpduError::SessionMismatch {
-                    expected,
-                    actual: pkt_uuid,
-                });
+        match self.session_uuid {
+            Some(expected) => {
+                if pkt_uuid != expected {
+                    Err(IpduError::SessionMismatch {
+                        expected,
+                        actual: pkt_uuid,
+                    })
+                } else {
+                    Ok(expected)
+                }
             }
-            Ok(expected)
-        } else {
-            Ok(pkt_uuid)
+            None => Ok(pkt_uuid),
         }
     }
 }
 
-impl<S: Read + Write> IlpSession<S> {
+impl<S: Read + Write + SetSocketTimeout> IlpSession<S> {
     /// Envía un paquete I-PDU a través de la sesión validando la máquina de estados de forma atómica.
     ///
+    /// Aplica dinámicamente `remaining_duration()` como timeout de socket antes de la E/S.
     /// Solo muta `self.state` y `self.session_uuid` si la escritura en el socket tiene éxito.
     pub fn send_packet(&mut self, packet: &IpduPacket) -> Result<(), IpduError> {
         if !self.state.is_active() {
             return Err(IpduError::InvalidStateTransition {
                 current: format!("{:?}", self.state),
-                received_performative: packet.header.performative.to_string(),
+                received_performative: packet.header().performative.to_string(),
             });
         }
 
-        // 1. Verificar deadline antes de enviar
+        // 1. Inicializar deadline si el paquete declara un TTL y aún no se fijó
+        if packet.header().deadline_ttl_ms > 0 && self.session_deadline.is_none() {
+            self.set_deadline_ttl(packet.header().deadline_ttl_ms);
+        }
+
+        // 2. Verificar y configurar deadline en el socket antes de enviar
         if let Some(rem) = self.remaining_duration() {
             if rem.is_zero() {
                 self.state = SessionState::Terminated(TerminationReason::Timeout);
                 return Err(IpduError::DeadlineExpired);
             }
+            self.stream.set_io_timeout(Some(rem))?;
         }
 
-        // 2. Pre-validar consistencia de UUID y FSM sin mutar el estado
-        let next_uuid = self.check_session_uuid(packet.header.session_uuid)?;
-        let next_state = self.transition_state(packet.header.performative, Direction::Send)?;
+        // 3. Pre-validar consistencia de UUID y FSM sin mutar el estado
+        let next_uuid = self.check_session_uuid(packet.header().session_uuid)?;
+        let next_state = self.transition_state(packet.header().performative, Direction::Send)?;
 
-        // 3. I/O en el stream subyacente
+        // 4. I/O en el stream subyacente
         self.stream.send_packet(packet)?;
 
-        // 4. Mutación atómica post-éxito
+        // 5. Mutación atómica post-éxito
         self.state = next_state;
         self.session_uuid = Some(next_uuid);
-        if packet.header.deadline_ttl_ms > 0 && self.session_deadline.is_none() {
-            self.set_deadline_ttl(packet.header.deadline_ttl_ms);
-        }
 
         Ok(())
     }
 
     /// Recibe un paquete I-PDU desde el canal validando framing, session_uuid y transiciones de la FSM.
     ///
-    /// Utiliza exclusivamente `std::io::ErrorKind` sin comparaciones de cadenas.
+    /// Aplica dinámicamente `remaining_duration()` como timeout de socket antes de la E/S.
     pub fn recv_packet(&mut self) -> Result<IpduPacket, IpduError> {
         if !self.state.is_active() {
             return Err(IpduError::InvalidStateTransition {
@@ -428,12 +461,13 @@ impl<S: Read + Write> IlpSession<S> {
             });
         }
 
-        // 1. Verificar deadline antes de recibir
+        // 1. Verificar y configurar deadline en el socket antes de recibir
         if let Some(rem) = self.remaining_duration() {
             if rem.is_zero() {
                 self.state = SessionState::Terminated(TerminationReason::Timeout);
                 return Err(IpduError::DeadlineExpired);
             }
+            self.stream.set_io_timeout(Some(rem))?;
         }
 
         // 2. I/O en el stream subyacente
@@ -451,7 +485,7 @@ impl<S: Read + Write> IlpSession<S> {
         };
 
         // 3. Validación de consistencia de UUID
-        let next_uuid = match self.check_session_uuid(packet.header.session_uuid) {
+        let next_uuid = match self.check_session_uuid(packet.header().session_uuid) {
             Ok(uuid) => uuid,
             Err(e) => {
                 self.state =
@@ -461,13 +495,13 @@ impl<S: Read + Write> IlpSession<S> {
         };
 
         // 4. Validación de transición legal de la FSM
-        match self.transition_state(packet.header.performative, Direction::Recv) {
+        match self.transition_state(packet.header().performative, Direction::Recv) {
             Ok(next_state) => {
                 // Mutación atómica post-validación
                 self.state = next_state;
                 self.session_uuid = Some(next_uuid);
-                if packet.header.deadline_ttl_ms > 0 && self.session_deadline.is_none() {
-                    self.set_deadline_ttl(packet.header.deadline_ttl_ms);
+                if packet.header().deadline_ttl_ms > 0 && self.session_deadline.is_none() {
+                    self.set_deadline_ttl(packet.header().deadline_ttl_ms);
                 }
                 Ok(packet)
             }
@@ -491,8 +525,7 @@ impl IlpSession<TcpStream> {
             None
         };
 
-        self.stream.get_ref().set_read_timeout(dur)?;
-        self.stream.get_ref().set_write_timeout(dur)?;
+        self.stream.set_io_timeout(dur)?;
         Ok(())
     }
 }

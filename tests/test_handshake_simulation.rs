@@ -29,7 +29,7 @@ fn test_full_3way_intent_handshake() {
         "query: convert stl cad mesh to Haas 5-axis G-Code",
     );
     assert_eq!(
-        pdu_discover.header.performative,
+        pdu_discover.header().performative,
         Performative::DiscoverSkill
     );
     let dec1 = firewall_a.inspect_egress(&client_proc, &pdu_discover);
@@ -47,7 +47,10 @@ fn test_full_3way_intent_handshake() {
         "{\"mesh_id\": \"cad_turbo_impeller.stl\", \"material\": \"Titanium-Ti6Al4V\"}",
     )
     .unwrap();
-    assert_eq!(pdu_propose.header.performative, Performative::ProposeIntent);
+    assert_eq!(
+        pdu_propose.header().performative,
+        Performative::ProposeIntent
+    );
     let dec2 = firewall_a.inspect_egress(&client_proc, &pdu_propose);
     assert_eq!(dec2.verdict, Verdict::Allow);
 
@@ -61,7 +64,10 @@ fn test_full_3way_intent_handshake() {
         "{\"price\": 220, \"sla_sec\": 45, \"attestation\": \"ISO-9001-AS9100D\"}",
     )
     .unwrap();
-    assert_eq!(pdu_counter.header.performative, Performative::CounterOffer);
+    assert_eq!(
+        pdu_counter.header().performative,
+        Performative::CounterOffer
+    );
     let dec3 = firewall_b.inspect_egress(&prov_proc, &pdu_counter);
     assert_eq!(dec3.verdict, Verdict::Allow);
 
@@ -74,7 +80,10 @@ fn test_full_3way_intent_handshake() {
         "{\"escrow_tx\": \"tx_0x9fbc18...\", \"status\": \"FUNDS_LOCKED\"}",
     )
     .unwrap();
-    assert_eq!(pdu_commit.header.performative, Performative::CommitContract);
+    assert_eq!(
+        pdu_commit.header().performative,
+        Performative::CommitContract
+    );
     let dec4 = firewall_a.inspect_egress(&client_proc, &pdu_commit);
     assert_eq!(dec4.verdict, Verdict::Allow);
 
@@ -94,7 +103,7 @@ fn test_full_3way_intent_handshake() {
         header_attest,
         b"{\"gcode_artifact_sha256\": \"e3b0c442...\", \"zkp_proof\": \"zk_proof_data\"}".to_vec(),
     );
-    assert_eq!(pdu_attest.header.performative, Performative::AttestResult);
+    assert_eq!(pdu_attest.header().performative, Performative::AttestResult);
     let dec5 = firewall_b.inspect_egress(&prov_proc, &pdu_attest);
     assert_eq!(dec5.verdict, Verdict::Allow);
 

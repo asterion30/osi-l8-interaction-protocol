@@ -21,6 +21,12 @@ use crate::ipdu::packet::IpduPacket;
 use crate::ipdu::performatives::Performative;
 #[cfg(feature = "mcp")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "mcp")]
+use std::collections::HashMap;
+#[cfg(feature = "mcp")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "mcp")]
+use std::sync::{Arc, Mutex};
 
 /// Constante FNV-1a 64-bit Offset Basis.
 const FNV_OFFSET_BASIS_64: u64 = 0xcbf29ce484222325;
@@ -28,7 +34,10 @@ const FNV_OFFSET_BASIS_64: u64 = 0xcbf29ce484222325;
 const FNV_PRIME_64: u64 = 0x100000001b3;
 
 /// Calcula el hash FNV-1a de 64 bits de forma determinista y sin asignación en memoria heap.
-/// Utilizado para derivar `skill_namespace_hash` a partir del nombre de herramientas o métodos MCP.
+///
+/// **Nota de seguridad:** FNV-1a se utiliza estrictamente para derivar `skill_namespace_hash`
+/// como identificador de enrutamiento y despacho rápido en $O(1)$ sin asignación en el heap.
+/// NO es una función criptográfica ni sustituye las firmas de usuario (`user_rule_sig_hash`).
 #[inline]
 pub fn fnv1a_64(data: &[u8]) -> u64 {
     let mut hash = FNV_OFFSET_BASIS_64;
@@ -127,6 +136,50 @@ impl McpRpcRequest {
     }
 }
 
+#[cfg(feature = "mcp")]
+/// Tabla de correlación de sesiones en memoria para asociar `jsonrpc_id` a `session_uuid`.
+///
+/// **Nota de arquitectura:** `skill_namespace_hash` se deriva mediante FNV-1a para enrutamiento
+/// no criptográfico en $O(1)$, mientras que `session_uuid` se administra de manera unívoca
+/// y monotónica en esta tabla por conexión activa para vincular pares petición-respuesta.
+#[derive(Debug, Clone, Default)]
+pub struct McpSessionCorrelationTable {
+    sessions: Arc<Mutex<HashMap<String, u64>>>,
+    next_uuid: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "mcp")]
+impl McpSessionCorrelationTable {
+    /// Crea una nueva tabla de correlación de sesiones.
+    pub fn new() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_uuid: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Registra o recupera el `session_uuid` asociado al identificador JSON-RPC.
+    pub fn get_or_create_session(&self, jsonrpc_id: &serde_json::Value) -> u64 {
+        let key = match jsonrpc_id {
+            serde_json::Value::String(s) => s.clone(),
+            _ => jsonrpc_id.to_string(),
+        };
+        let mut map = self.sessions.lock().unwrap();
+        *map.entry(key)
+            .or_insert_with(|| self.next_uuid.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Valida y retira el `session_uuid` para una respuesta entrante con dicho `jsonrpc_id`.
+    pub fn resolve_session(&self, jsonrpc_id: &serde_json::Value) -> Option<u64> {
+        let key = match jsonrpc_id {
+            serde_json::Value::String(s) => s.clone(),
+            _ => jsonrpc_id.to_string(),
+        };
+        let mut map = self.sessions.lock().unwrap();
+        map.remove(&key)
+    }
+}
+
 /// Adaptador puente (Bridge) para traducción bidireccional entre MCP JSON-RPC e I-PDU de Capa 8.
 pub struct McpBridge;
 
@@ -152,15 +205,10 @@ impl McpBridge {
     }
 
     #[cfg(feature = "mcp")]
-    /// Encapsula una petición MCP JSON-RPC dentro de un paquete canónico `IpduPacket`.
-    ///
-    /// Mapeo de campos:
-    /// - `tools/call` -> `Performative::ProposeIntent`
-    /// - `tools/list` / `prompts/list` / `resources/list` -> `Performative::DiscoverSkill`
-    /// - cualquier otro método -> `Err(McpBridgeError::UnsupportedMethod(req.method.clone()))`
-    /// - `session_uuid` derivado determinísticamente de `req.id` mediante FNV-1a.
-    pub fn encapsulate_request(
+    /// Encapsula una petición MCP JSON-RPC con un `session_uuid` explícito (procedente de tabla de correlación).
+    pub fn encapsulate_request_with_session(
         req: &McpRpcRequest,
+        session_uuid: u64,
         budget_cap: u32,
         deadline_ttl_ms: u32,
     ) -> Result<IpduPacket, McpBridgeError> {
@@ -170,7 +218,6 @@ impl McpBridge {
             _ => return Err(McpBridgeError::UnsupportedMethod(req.method.clone())),
         };
 
-        let session_uuid = Self::derive_session_uuid(&req.id);
         let tool_name = req.tool_name();
         let skill_hash = Self::derive_skill_hash(&req.method, tool_name);
 
@@ -193,12 +240,30 @@ impl McpBridge {
     }
 
     #[cfg(feature = "mcp")]
+    /// Encapsula una petición MCP JSON-RPC dentro de un paquete canónico `IpduPacket`.
+    pub fn encapsulate_request(
+        req: &McpRpcRequest,
+        budget_cap: u32,
+        deadline_ttl_ms: u32,
+    ) -> Result<IpduPacket, McpBridgeError> {
+        let session_uuid = Self::derive_session_uuid(&req.id);
+        Self::encapsulate_request_with_session(req, session_uuid, budget_cap, deadline_ttl_ms)
+    }
+
+    #[cfg(feature = "mcp")]
     /// Desencapsula una petición MCP JSON-RPC desde un paquete `IpduPacket`.
     pub fn decapsulate_request(packet: &IpduPacket) -> Result<McpRpcRequest, McpBridgeError> {
-        let req: McpRpcRequest = serde_json::from_slice(&packet.payload).map_err(|e| {
+        let req: McpRpcRequest = serde_json::from_slice(packet.payload()).map_err(|e| {
             McpBridgeError::InvalidJsonRpc(format!("Error al deserializar JSON-RPC: {}", e))
         })?;
         Ok(req)
+    }
+
+    #[cfg(feature = "mcp")]
+    /// Desencapsula una petición MCP JSON-RPC desde un paquete `IpduPacket` (alias funcional de decapsulate_request).
+    #[inline]
+    pub fn unwrap_packet(packet: &IpduPacket) -> Result<McpRpcRequest, McpBridgeError> {
+        Self::decapsulate_request(packet)
     }
 
     #[cfg(feature = "mcp")]
@@ -245,7 +310,7 @@ impl McpBridge {
     #[cfg(feature = "mcp")]
     /// Desencapsula una respuesta MCP JSON-RPC desde un paquete `IpduPacket`.
     pub fn decapsulate_response(packet: &IpduPacket) -> Result<McpRpcResponse, McpBridgeError> {
-        let resp: McpRpcResponse = serde_json::from_slice(&packet.payload).map_err(|e| {
+        let resp: McpRpcResponse = serde_json::from_slice(packet.payload()).map_err(|e| {
             McpBridgeError::InvalidJsonRpc(format!(
                 "Error al deserializar respuesta JSON-RPC: {}",
                 e

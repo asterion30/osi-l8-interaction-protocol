@@ -81,8 +81,8 @@ fn main() {
         "[{:>8} µs] [Wire Format] Encapsulado en I-PDU (WireLen: {} bytes, Performativa: {}, SkillHash: {:#018x})",
         demo_start.elapsed().as_micros(),
         packet.wire_len(),
-        packet.header.performative,
-        packet.header.skill_namespace_hash
+        packet.header().performative,
+        packet.header().skill_namespace_hash
     );
 
     // Simulación de ejecución en el servidor MCP remoto y respuesta
@@ -97,7 +97,7 @@ fn main() {
     };
     let response_packet = McpBridge::encapsulate_response(
         &mcp_response,
-        packet.header.skill_namespace_hash,
+        packet.header().skill_namespace_hash,
         42, // Gasto real: 42 tokens
     )
     .expect("Encapsular respuesta");
@@ -110,8 +110,8 @@ fn main() {
     println!(
         "[{:>8} µs] [Escrow Commit] Contrato sellado en Capa 8: Performativa {} | Presupuesto Consumido: {} tokens",
         demo_start.elapsed().as_micros(),
-        response_packet.header.performative,
-        response_packet.header.max_budget_cap
+        response_packet.header().performative,
+        response_packet.header().max_budget_cap
     );
 
     // -------------------------------------------------------------------------

@@ -6,12 +6,15 @@ use super::performatives::Performative;
 use std::fmt;
 
 /// Paquete completo de Capa 8 I-PDU: Cabecera Fija + Prefijo de Longitud + Payload Semántico.
+///
+/// Encapsulamiento estricto: los campos `header` y `payload` son privados para evitar
+/// mutaciones no verificadas que violen las cotas de memoria (`MAX_ILP_PAYLOAD_SIZE = 64 KiB`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpduPacket {
     /// Cabecera binaria estructurada de 36 bytes.
-    pub header: IpduHeader,
+    header: IpduHeader,
     /// Carga útil semántica (representación de contexto, grafo o tensores de intención).
-    pub payload: Vec<u8>,
+    payload: Vec<u8>,
 }
 
 /// Límite duro de protocolo en Capa 8 (64 KB por I-PDU para evitar OOM en Kernel/Userspace).
@@ -75,6 +78,24 @@ impl IpduPacket {
     pub fn new(header: IpduHeader, payload: Vec<u8>) -> Self {
         Self::try_new(header, payload)
             .expect("El payload excede la cota máxima permitida (MAX_ILP_PAYLOAD_SIZE = 64 KiB)")
+    }
+
+    /// Retorna una referencia inmutable a la cabecera del paquete.
+    #[inline]
+    pub fn header(&self) -> &IpduHeader {
+        &self.header
+    }
+
+    /// Retorna una referencia inmutable al payload del paquete.
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Descompone el paquete consumiéndolo en su cabecera y payload.
+    #[inline]
+    pub fn into_parts(self) -> (IpduHeader, Vec<u8>) {
+        (self.header, self.payload)
     }
 
     /// Longitud total del paquete serializado en bytes.
@@ -163,7 +184,7 @@ impl IpduPacket {
             ttl_ms,
             sig_hash,
         )?;
-        Ok(Self::new(header, intent_payload.as_bytes().to_vec()))
+        Self::try_new(header, intent_payload.as_bytes().to_vec())
     }
 
     /// Crea un paquete `COUNTER_OFFER` ajustando precio o SLA.
@@ -185,7 +206,7 @@ impl IpduPacket {
             counter_ttl_ms,
             sig_hash,
         )?;
-        Ok(Self::new(header, terms.as_bytes().to_vec()))
+        Self::try_new(header, terms.as_bytes().to_vec())
     }
 
     /// Crea un paquete `COMMIT_CONTRACT` confirmando el acuerdo y escrow.
@@ -206,7 +227,7 @@ impl IpduPacket {
             30_000,
             sig_hash,
         )?;
-        Ok(Self::new(header, contract_details.as_bytes().to_vec()))
+        Self::try_new(header, contract_details.as_bytes().to_vec())
     }
 
     /// Crea un paquete `REJECT_POLICY` notificando rechazo por violación de gobernanza.
@@ -225,7 +246,7 @@ impl IpduPacket {
             0,
             0,
         )?;
-        Ok(Self::new(header, reason.as_bytes().to_vec()))
+        Self::try_new(header, reason.as_bytes().to_vec())
     }
 
     /// Crea un paquete `ATTEST_RESULT` entregando pruebas criptográficas (VC / ZKP) del resultado.
@@ -246,7 +267,7 @@ impl IpduPacket {
             30_000,
             sig_hash,
         )?;
-        Ok(Self::new(header, proof_payload.as_bytes().to_vec()))
+        Self::try_new(header, proof_payload.as_bytes().to_vec())
     }
 }
 

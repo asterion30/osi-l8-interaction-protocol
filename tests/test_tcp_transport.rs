@@ -17,13 +17,13 @@ fn test_tcp_transport_roundtrip_handshake() {
         let req = ilp_stream
             .recv_packet()
             .expect("Servidor recibe DISCOVER_SKILL");
-        assert_eq!(req.header.performative.to_string(), "DISCOVER_SKILL");
+        assert_eq!(req.header().performative.to_string(), "DISCOVER_SKILL");
         assert_eq!(req.payload_as_str().unwrap(), "query:data-analysis");
 
         // 2. Responder con PROPOSE_INTENT
         let resp = IpduPacket::propose_intent(
             0xFEED_FACE_CAFE_BABE,
-            req.header.session_uuid,
+            req.header().session_uuid,
             2,
             500,
             5_000,
@@ -55,9 +55,9 @@ fn test_tcp_transport_roundtrip_handshake() {
     let response = client_stream
         .recv_packet()
         .expect("Cliente recibe PROPOSE_INTENT");
-    assert_eq!(response.header.performative.to_string(), "PROPOSE_INTENT");
-    assert_eq!(response.header.max_budget_cap, 500);
-    assert_eq!(response.header.session_uuid, 0x1234_5678_9ABC_DEF0);
+    assert_eq!(response.header().performative.to_string(), "PROPOSE_INTENT");
+    assert_eq!(response.header().max_budget_cap, 500);
+    assert_eq!(response.header().session_uuid, 0x1234_5678_9ABC_DEF0);
     assert!(response.payload_as_str().unwrap().contains("ready"));
 
     server_handle
@@ -74,7 +74,7 @@ fn test_tcp_transport_empty_payload() {
         let (stream, _) = listener.accept().expect("Accept");
         let mut ilp_stream = IlpStream::new(stream);
         let pkt = ilp_stream.recv_packet().expect("Recibir paquete");
-        assert_eq!(pkt.payload.len(), 0);
+        assert_eq!(pkt.payload().len(), 0);
         ilp_stream.send_packet(&pkt).expect("Eco de paquete");
     });
 
@@ -83,7 +83,7 @@ fn test_tcp_transport_empty_payload() {
 
     client.send_packet(&empty_packet).expect("Enviar");
     let echoed = client.recv_packet().expect("Recibir eco");
-    assert_eq!(echoed.payload.len(), 0);
+    assert_eq!(echoed.payload().len(), 0);
 
     server.join().unwrap();
 }
@@ -130,7 +130,7 @@ fn test_tcp_transport_allocation_bomb_rejection() {
     // Cliente malicioso envía cabecera válida pero longitud mayor a 64KB
     let mut raw_client = TcpStream::connect(server_addr).expect("Connect");
     let dummy = IpduPacket::discover_skill(0x1, 0x2, CognitivePolicyFlags::EMPTY, "");
-    let mut bad_bytes = dummy.header.to_canonical_bytes().to_vec();
+    let mut bad_bytes = dummy.header().to_canonical_bytes().to_vec();
     let malformed_len = (MAX_ILP_PAYLOAD_SIZE as u32) + 1;
     bad_bytes.extend_from_slice(&malformed_len.to_be_bytes());
 

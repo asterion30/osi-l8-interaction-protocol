@@ -17,11 +17,15 @@ trap 'rm -f "$TMP_BENCH"' EXIT
 
 cd "$ROOT_DIR"
 
-# Ejecutar el benchmark y verificar código de salida
-if ! cargo run --release --example benchmark_latency > "$TMP_BENCH" 2>&1; then
-    echo "❌ Error: El benchmark falló con código de salida $?" >&2
+# Ejecutar el benchmark y verificar código de salida de forma precisa
+set +e
+cargo run --release --example benchmark_latency > "$TMP_BENCH" 2>&1
+EXIT_CODE=$?
+set -e
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "❌ Error: El benchmark falló con código de salida $EXIT_CODE" >&2
     cat "$TMP_BENCH" >&2
-    exit 1
+    exit $EXIT_CODE
 fi
 
 CURRENT_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"

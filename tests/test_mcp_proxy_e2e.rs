@@ -1,9 +1,7 @@
 #![cfg(feature = "mcp")]
 
-use ilp_core::bridge::{McpBridge, McpRpcRequest};
 use ilp_core::governance::{
-    CognitiveErrorCode, CognitiveFirewall, ProcessTaintContext, TaintTag, UserGovernancePolicy,
-    Verdict,
+    CognitiveFirewall, ProcessTaintContext, TaintTag, UserGovernancePolicy,
 };
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
@@ -94,10 +92,87 @@ impl Drop for MockToolServer {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 }
+/// Gateway MCP Capa 8 del lado servidor.
+/// Escucha en TCP exclusivamente paquetes binarios `IpduPacket` sobre `IlpStream`.
+/// Desencapsula la llamada JSON-RPC original con `IlpMcpGateway::receive_and_unwrap`,
+/// ejecuta la llamada contra el `MockToolServer` y responde con `IlpMcpGateway::wrap_and_send_response`.
+struct IlpGatewayServer {
+    pub addr: String,
+    shutdown: Arc<AtomicBool>,
+}
 
-/// Proxy Sidecar ILP (Capa 8) para MCP.
-/// Intercepta llamadas JSON-RPC, las encapsula en I-PDU, evalúa la política con
-/// `CognitiveFirewall::inspect_egress`, y solo reenvía al Tool Server si el veredicto es `Allow`.
+impl IlpGatewayServer {
+    pub fn spawn(backend_addr: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind gateway server");
+        let addr = listener.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let shut_clone = Arc::clone(&shutdown);
+
+        listener
+            .set_nonblocking(true)
+            .expect("Set non-blocking gateway");
+
+        thread::spawn(move || {
+            while !shut_clone.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let backend_target = backend_addr.clone();
+                        thread::spawn(move || {
+                            let mut ilp_stream = ilp_core::transport::IlpStream::new(stream);
+                            while let Ok((packet, mcp_req)) =
+                                ilp_core::bridge::IlpMcpGateway::receive_and_unwrap(&mut ilp_stream)
+                            {
+                                // Reenvío local JSON-RPC al MockToolServer
+                                if let Ok(mut backend) = TcpStream::connect(&backend_target) {
+                                    let mut req_str = serde_json::to_string(&mcp_req).unwrap();
+                                    req_str.push('\n');
+                                    let _ = backend.write_all(req_str.as_bytes());
+                                    let _ = backend.flush();
+
+                                    let mut backend_reader = BufReader::new(backend);
+                                    let mut backend_resp = String::new();
+                                    if backend_reader.read_line(&mut backend_resp).is_ok() {
+                                        if let Ok(mcp_resp) = serde_json::from_str::<
+                                            ilp_core::bridge::McpRpcResponse,
+                                        >(
+                                            &backend_resp
+                                        ) {
+                                            let _ =
+                                                ilp_core::bridge::IlpMcpGateway::wrap_and_send_response(
+                                                    &mcp_resp,
+                                                    packet.header().skill_namespace_hash,
+                                                    100,
+                                                    &mut ilp_stream,
+                                                );
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self { addr, shutdown }
+    }
+}
+
+impl Drop for IlpGatewayServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Proxy Sidecar ILP (Capa 8) para clientes MCP.
+/// Recibe llamadas JSON-RPC del cliente y las audita con `CognitiveFirewall`.
+/// Si el veredicto es `Allow`, las envía como `IpduPacket` binario por `IlpStream` hacia el Gateway.
+/// Si es `Drop`, responde de inmediato con JSON-RPC de error sin emitir ningún byte a la red.
 struct IlpSidecarProxy {
     pub addr: String,
     #[allow(dead_code)]
@@ -106,7 +181,7 @@ struct IlpSidecarProxy {
 }
 
 impl IlpSidecarProxy {
-    pub fn spawn(backend_addr: String, taint_context: Arc<Mutex<ProcessTaintContext>>) -> Self {
+    pub fn spawn(gateway_addr: String, taint_context: Arc<Mutex<ProcessTaintContext>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind proxy sidecar");
         let addr = listener.local_addr().unwrap().to_string();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -125,13 +200,15 @@ impl IlpSidecarProxy {
                 ..Default::default()
             };
             let firewall = CognitiveFirewall::new(policy);
+            let correlation = Arc::new(ilp_core::bridge::McpSessionCorrelationTable::new());
 
             while !shut_clone.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((client_stream, _)) => {
-                        let backend_target = backend_addr.clone();
+                        let gateway_target = gateway_addr.clone();
                         let taint_ref = Arc::clone(&taint_clone);
                         let mut firewall_clone = firewall.clone();
+                        let corr_ref = Arc::clone(&correlation);
 
                         thread::spawn(move || {
                             let mut client_reader =
@@ -144,88 +221,62 @@ impl IlpSidecarProxy {
                                     break;
                                 }
 
-                                match serde_json::from_str::<McpRpcRequest>(&line) {
-                                    Ok(mcp_req) => {
-                                        let current_taint = taint_ref.lock().unwrap().clone();
-                                        match McpBridge::inspect_and_wrap(
-                                            &mut firewall_clone,
-                                            &current_taint,
-                                            &mcp_req,
-                                            1_000,
-                                            5_000,
-                                        ) {
-                                            Ok((_packet, decision)) => {
-                                                if decision.verdict == Verdict::Allow {
-                                                    // Reenvío al MockToolServer
-                                                    if let Ok(mut backend) =
-                                                        TcpStream::connect(&backend_target)
-                                                    {
-                                                        let _ = backend.write_all(line.as_bytes());
-                                                        let _ = backend.flush();
+                                if let Ok(gateway_tcp) = TcpStream::connect(&gateway_target) {
+                                    let mut ilp_stream =
+                                        ilp_core::transport::IlpStream::new(gateway_tcp);
+                                    let current_taint = taint_ref.lock().unwrap().clone();
 
-                                                        let mut backend_reader =
-                                                            BufReader::new(backend);
-                                                        let mut backend_resp = String::new();
-                                                        if backend_reader
-                                                            .read_line(&mut backend_resp)
-                                                            .is_ok()
-                                                        {
-                                                            let _ = client_writer
-                                                                .write_all(backend_resp.as_bytes());
-                                                            let _ = client_writer.flush();
-                                                        }
-                                                    }
-                                                } else {
-                                                    // BLOQUEO EN EL BORDE: No se reenvía al backend
-                                                    let err_resp = json!({
-                                                        "jsonrpc": "2.0",
-                                                        "id": mcp_req.id,
-                                                        "error": {
-                                                            "code": -32000,
-                                                            "message": format!(
-                                                                "Blocked by Capa 8 MSAC Firewall: {:?}",
-                                                                decision.error_code.unwrap_or(CognitiveErrorCode::EpermCognitivePolicy)
-                                                            ),
-                                                            "verdict": "Drop",
-                                                            "reason": decision.reason
-                                                        }
-                                                    });
-                                                    let mut err_str = err_resp.to_string();
-                                                    err_str.push('\n');
+                                    match ilp_core::bridge::McpProxyRelay::handle_client_request(
+                                        &line,
+                                        &mut ilp_stream,
+                                        &mut firewall_clone,
+                                        &current_taint,
+                                        &corr_ref,
+                                        1_000,
+                                        5_000,
+                                    ) {
+                                        Ok(ilp_core::bridge::ClientIngressResult::Forwarded {
+                                            ..
+                                        }) => {
+                                            // Recibir respuesta binaria IpduPacket desde el Gateway
+                                            if let Ok(resp_packet) = ilp_stream.recv_packet() {
+                                                if let Ok(resp) =
+                                                    ilp_core::bridge::McpBridge::decapsulate_response(
+                                                        &resp_packet,
+                                                    )
+                                                {
+                                                    let mut resp_str =
+                                                        serde_json::to_string(&resp).unwrap();
+                                                    resp_str.push('\n');
                                                     let _ =
-                                                        client_writer.write_all(err_str.as_bytes());
+                                                        client_writer.write_all(resp_str.as_bytes());
                                                     let _ = client_writer.flush();
                                                 }
                                             }
-                                            Err(e) => {
-                                                let err_resp = json!({
-                                                    "jsonrpc": "2.0",
-                                                    "id": mcp_req.id,
-                                                    "error": {
-                                                        "code": -32600,
-                                                        "message": format!("ILP Protocol error: {}", e)
-                                                    }
-                                                });
-                                                let mut err_str = err_resp.to_string();
-                                                err_str.push('\n');
-                                                let _ = client_writer.write_all(err_str.as_bytes());
-                                                let _ = client_writer.flush();
-                                            }
                                         }
-                                    }
-                                    Err(_) => {
-                                        let err_resp = json!({
-                                            "jsonrpc": "2.0",
-                                            "id": null,
-                                            "error": {
-                                                "code": -32700,
-                                                "message": "Parse error"
-                                            }
-                                        });
-                                        let mut err_str = err_resp.to_string();
-                                        err_str.push('\n');
-                                        let _ = client_writer.write_all(err_str.as_bytes());
-                                        let _ = client_writer.flush();
+                                        Ok(ilp_core::bridge::ClientIngressResult::Blocked {
+                                            error_response,
+                                            ..
+                                        }) => {
+                                            let mut err_str = error_response.to_string();
+                                            err_str.push('\n');
+                                            let _ = client_writer.write_all(err_str.as_bytes());
+                                            let _ = client_writer.flush();
+                                        }
+                                        Err(e) => {
+                                            let err_resp = json!({
+                                                "jsonrpc": "2.0",
+                                                "id": null,
+                                                "error": {
+                                                    "code": -32600,
+                                                    "message": format!("ILP Protocol error: {}", e)
+                                                }
+                                            });
+                                            let mut err_str = err_resp.to_string();
+                                            err_str.push('\n');
+                                            let _ = client_writer.write_all(err_str.as_bytes());
+                                            let _ = client_writer.flush();
+                                        }
                                     }
                                 }
                                 line.clear();
@@ -269,17 +320,20 @@ fn send_mcp_request(addr: &str, req: &serde_json::Value) -> serde_json::Value {
 
 #[test]
 fn test_mcp_proxy_e2e_real_enforcement() {
-    // 1. Iniciar Mock MCP Tool Server en puerto efímero
+    // 1. Iniciar Mock MCP Tool Server en puerto efímero (habla JSON-RPC)
     let mock_server = MockToolServer::spawn();
     assert_eq!(mock_server.executions.load(Ordering::SeqCst), 0);
 
-    // 2. Iniciar Proxy Sidecar ILP (Capa 8) apuntando al mock server
+    // 2. Iniciar Gateway MCP ILP (habla 100% binario I-PDU hacia el proxy, y JSON-RPC hacia el backend)
+    let gateway = IlpGatewayServer::spawn(mock_server.addr.clone());
+
+    // 3. Iniciar Proxy Sidecar ILP (Capa 8) apuntando al Gateway por IlpStream binario
     let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
         4096,
         "Claude-Worker",
         true, // external egress
     )));
-    let proxy = IlpSidecarProxy::spawn(mock_server.addr.clone(), Arc::clone(&taint_context));
+    let proxy = IlpSidecarProxy::spawn(gateway.addr.clone(), Arc::clone(&taint_context));
 
     // -------------------------------------------------------------------------
     // CASO 1: Llamada legítima con proceso limpio -> PERMITIDA Y EJECUTADA
