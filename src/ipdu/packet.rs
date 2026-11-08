@@ -186,6 +186,46 @@ impl IpduPacket {
         )?;
         Ok(Self::new(header, contract_details.as_bytes().to_vec()))
     }
+
+    /// Crea un paquete `REJECT_POLICY` notificando rechazo por violación de gobernanza.
+    pub fn reject_policy(
+        session_uuid: u64,
+        skill_hash: u64,
+        reason: &str,
+    ) -> Result<Self, IpduError> {
+        let header = IpduHeader::new(
+            Performative::RejectPolicy,
+            0,
+            CognitivePolicyFlags::EMPTY,
+            skill_hash,
+            session_uuid,
+            0,
+            0,
+            0,
+        )?;
+        Ok(Self::new(header, reason.as_bytes().to_vec()))
+    }
+
+    /// Crea un paquete `ATTEST_RESULT` entregando pruebas criptográficas (VC / ZKP) del resultado.
+    pub fn attest_result(
+        session_uuid: u64,
+        skill_hash: u64,
+        autonomy_tier: u8,
+        sig_hash: u64,
+        proof_payload: &str,
+    ) -> Result<Self, IpduError> {
+        let header = IpduHeader::new(
+            Performative::AttestResult,
+            autonomy_tier,
+            CognitivePolicyFlags::EMPTY,
+            skill_hash,
+            session_uuid,
+            0,
+            30_000,
+            sig_hash,
+        )?;
+        Ok(Self::new(header, proof_payload.as_bytes().to_vec()))
+    }
 }
 
 impl fmt::Display for IpduPacket {

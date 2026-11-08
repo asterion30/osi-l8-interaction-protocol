@@ -9,9 +9,12 @@ Este documento detalla la metodología, cobertura y resultados de la suite de pr
 | Módulo Evaluado | Archivo de Test | Pruebas | Resultado | Cobertura Funcional |
 | :--- | :--- | :---: | :---: | :--- |
 | **I-PDU Wire Format** | `tests/test_ipdu_wire.rs` | 8 | **100% PASS** | Empaquetado binario Big-Endian, Word 0 bitfields, cabecera canónica (36B), cabecera compacta (32B), defensa anti Allocation Bomb y bounds checking. |
-| **Cognitive Firewall (MSAC)** | `tests/test_firewall_msac.rs` | 8 | **100% PASS** | Pipeline MSAC de 3 pasos: Taint Tracking, límites de usuario O(1), guardián heurístico SLM contra DLP y Prompt Injection, y Ring Buffer acotado contra agotamiento de memoria. |
+| **Cognitive Firewall (MSAC)** | `tests/test_firewall_msac.rs` | 12 | **100% PASS** | Pipeline MSAC de 3 pasos: Taint Tracking con trazabilidad forense de origen, parser declarativo `.conf`, límites O(1), DLP/Prompt Injection y Ring Buffer acotado. |
+| **Transport Session & FSM** | `tests/test_transport_fsm.rs` | 5 | **100% PASS** | Máquina de estados de sesión (`IlpSession`), validación de orden del handshake, verificación de `session_uuid`, timeouts con `deadline_ttl_ms` y desconexión limpia. |
+| **TCP Sockets & Transport** | `tests/test_tcp_transport.rs` | 4 | **100% PASS** | Framing sobre streams TCP reales, contención de Allocation Bomb y serialización/deserialización en bucle. |
+| **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 5 | **100% PASS** | Encapsulamiento de llamadas MCP JSON-RPC en tramas I-PDU, hash FNV-1a e intercepción preventiva contra Prompt Injection y DLP. |
 | **Protocol Handshake** | `tests/test_handshake_simulation.rs` | 1 | **100% PASS** | Negociación completa del 3-Way Intent Handshake entre Cliente y Proveedor con auditoría en ambos firewalls. |
-| **Total General** | **17 Pruebas** | **17** | **17 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
+| **Total General** | **6 Suites de Tests** | **35** | **35 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
 
 ---
 

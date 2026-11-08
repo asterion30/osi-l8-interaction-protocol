@@ -222,6 +222,15 @@ pub enum IpduError {
     TruncatedPayload { expected: usize, actual: usize },
     Io(String),
     ConnectionClosed,
+    InvalidStateTransition {
+        current: String,
+        received_performative: String,
+    },
+    DeadlineExpired,
+    SessionMismatch {
+        expected: u64,
+        actual: u64,
+    },
 }
 
 impl From<PerformativeError> for IpduError {
@@ -284,6 +293,20 @@ impl fmt::Display for IpduError {
             }
             Self::Io(msg) => write!(f, "Error de E/S de transporte: {}", msg),
             Self::ConnectionClosed => write!(f, "Conexión de transporte cerrada por el par remoto"),
+            Self::InvalidStateTransition {
+                current,
+                received_performative,
+            } => write!(
+                f,
+                "Transición de estado inválida: estado actual '{}', performativa recibida '{}'",
+                current, received_performative
+            ),
+            Self::DeadlineExpired => write!(f, "Tiempo de espera (deadline TTL) expirado"),
+            Self::SessionMismatch { expected, actual } => write!(
+                f,
+                "Discrepancia en session_uuid: esperado 0x{:016X}, recibido 0x{:016X}",
+                expected, actual
+            ),
         }
     }
 }

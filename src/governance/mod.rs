@@ -10,5 +10,5 @@ pub use firewall::{
     DEFAULT_MAX_AUDIT_LOG_CAPACITY,
 };
 pub use gatekeeper::{GatekeeperThreat, SlmGatekeeper};
-pub use policy::UserGovernancePolicy;
-pub use taint::{ProcessTaintContext, TaintTag};
+pub use policy::{PolicyParseError, UserGovernancePolicy};
+pub use taint::{ProcessTaintContext, TaintEvent, TaintTag};

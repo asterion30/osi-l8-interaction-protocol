@@ -9,6 +9,10 @@
 //! 3. Blindaje contra ataques de agotamiento de memoria (OOM / Allocation Bomb) verificando cotas (`<= 64KB`).
 //! 4. Lectura exacta de la carga útil semántica (`payload`).
 
+pub mod session;
+
+pub use session::{IlpSession, SessionState, SetSocketTimeout, TerminationReason};
+
 use crate::ipdu::header::{IpduError, IpduHeader, CANONICAL_HEADER_SIZE};
 use crate::ipdu::packet::{IpduPacket, MAX_ILP_PAYLOAD_SIZE};
 use std::io::{Read, Write};

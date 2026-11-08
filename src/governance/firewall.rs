@@ -161,9 +161,10 @@ impl CognitiveFirewall {
                 | TaintTag::GOVERNMENT_ID;
 
             if process.has_taint(critical_taint) {
+                let sources = process.format_taint_sources();
                 let reason = format!(
-                    "Bloqueo MSAC: Proceso PID {} ({}) tiene tinte [{}] y prohíbe salida a red externa",
-                    process.pid, process.agent_name, process.taint
+                    "Bloqueo MSAC: Proceso PID {} ({}) tiene tinte [{}] (orígenes: {}) y prohíbe salida a red externa",
+                    process.pid, process.agent_name, process.taint, sources
                 );
 
                 let record = AuditRecord {

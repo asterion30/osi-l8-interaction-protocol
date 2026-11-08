@@ -55,8 +55,8 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 # Compilar la biblioteca y binarios
 cargo build
 
-# Ejecutar la suite completa de tests unitarios y de integración (21 tests)
-cargo test
+# Ejecutar la suite completa de tests unitarios y de integración (31 tests)
+cargo test --all-targets --all-features
 
 # Comprobar análisis estático sin advertencias
 cargo clippy --all-targets -- -D warnings
@@ -80,45 +80,67 @@ Verás una salida en consola con marcas de tiempo en microsegundos ($\mu s$) y n
 ## 3. Guía de Integración Paso a Paso en Código Rust
 
 ### Paso 1: Configurar la Política Soberana del Usuario (`UserGovernancePolicy`)
+Puedes definirla programáticamente o cargarla sin recompilar desde un archivo de configuración `.conf`:
+
 ```rust
 use ilp_core::governance::UserGovernancePolicy;
 
-let mut policy = UserGovernancePolicy::default();
-policy.max_budget_cap = 500; // Máximo 500 tokens/créditos por sesión
-policy.deny_external_egress_if_tainted = true; // Prohibir salida si hay PII
-policy.require_sandbox_above_tier = 2; // Exigir sandbox para autonomía media/alta
+// Opción A: Carga declarativa desde archivo .conf (Zero-Dependencies)
+let conf_str = std::fs::read_to_string("policies/default_msac.conf")
+    .expect("Lectura de archivo de configuración");
+let policy = UserGovernancePolicy::from_conf_str(&conf_str)
+    .expect("Parse de políticas");
+
+// Opción B: Construcción programática
+let mut custom_policy = UserGovernancePolicy::default();
+custom_policy.max_budget_cap = 50_000;
+custom_policy.deny_external_egress_if_tainted = true;
+custom_policy.require_sandbox_above_tier = 2;
 ```
 
-### Paso 2: Inicializar el Firewall Cognitivo y el Contexto de Tinte
+### Paso 2: Inicializar el Firewall Cognitivo y el Contexto de Tinte con Trazabilidad
 ```rust
 use ilp_core::governance::{CognitiveFirewall, ProcessTaintContext, TaintTag};
 
 let mut firewall = CognitiveFirewall::new(policy);
-let mut taint_context = ProcessTaintContext::new(1001, "Agente-Analista", false);
+let mut taint_context = ProcessTaintContext::new(1001, "Agente-Analista", true);
 
-// Si el agente lee datos médicos clasificados:
-taint_context.contaminate_with(TaintTag::MEDICAL_PII);
+// Si el agente interactúa con datos confidenciales, se registra el origen exacto:
+taint_context.apply_taint(
+    TaintTag::MEDICAL_PII,
+    "read:/var/lib/hospital/oncology_records.db"
+);
 ```
 
-### Paso 3: Inspeccionar Paquetes con el Proxy Egress antes de Enviar
+### Paso 3: Inspeccionar y Transmitir con la FSM de Transporte (`IlpSession`)
 ```rust
 use ilp_core::governance::Verdict;
-use ilp_core::ipdu::IpduPacket;
-use ilp_core::transport::IlpStream;
+use ilp_core::ipdu::flags::CognitivePolicyFlags;
+use ilp_core::ipdu::packet::IpduPacket;
+use ilp_core::transport::{IlpSession, IlpStream};
 use std::net::TcpStream;
 
-// Establecer conexión de red
-let mut stream = IlpStream::connect("127.0.0.1:8088").expect("Conexión TCP");
+// Establecer conexión de red y sesión de Capa 8
+let stream = IlpStream::connect("127.0.0.1:8088").expect("Conexión TCP");
+let mut session = IlpSession::new(stream);
+
+// Construir paquete inicial de descubrimiento o propuesta de intención
+let packet = IpduPacket::discover_skill(
+    0xCAFE_BABE,
+    0x1234_5678_9ABC_DEF0,
+    CognitivePolicyFlags::EMPTY,
+    "oncology_diagnostic_query",
+);
 
 // Inspección obligatoria previa al socket
-let packet = /* construir IpduPacket */;
 let decision = firewall.inspect_egress(&taint_context, &packet);
 
 if decision.verdict == Verdict::Allow {
-    stream.send_packet(&packet).expect("Envío seguro a la red");
+    // IlpSession valida automáticamente la máquina de estados y el session_uuid
+    session.send_packet(&packet).expect("Envío conforme a la FSM");
 } else {
     eprintln!("⛔ Paquete bloqueado por el firewall: {:?}", decision.reason);
-    // Ningún dato fue transmitido
+    // Ningún byte tocó el socket de red
 }
 ```
 

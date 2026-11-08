@@ -115,6 +115,17 @@ impl fmt::Display for TaintTag {
     }
 }
 
+/// Evento auditable de contaminación de tinte con trazabilidad de origen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaintEvent {
+    /// Etiqueta asignada al proceso.
+    pub tag: TaintTag,
+    /// Descriptor de origen (ej. "read:/etc/medical_records.db" o "mcp:tool_output:patient_lookup").
+    pub source_descriptor: String,
+    /// Marca temporal en nanosegundos desde UNIX_EPOCH.
+    pub timestamp_ns: u64,
+}
+
 /// Contexto de ejecución del proceso o agente emisor en el Sistema Operativo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessTaintContext {
@@ -126,6 +137,8 @@ pub struct ProcessTaintContext {
     pub taint: TaintTag,
     /// Destino de la conexión (true si es red pública / internet externo).
     pub is_external_egress: bool,
+    /// Historial cronológico de eventos de mancha con descriptores de origen.
+    pub taint_history: Vec<TaintEvent>,
 }
 
 impl ProcessTaintContext {
@@ -136,18 +149,48 @@ impl ProcessTaintContext {
             agent_name: agent_name.into(),
             taint: TaintTag::CLEAN,
             is_external_egress,
+            taint_history: Vec::new(),
         }
+    }
+
+    /// Aplica una nueva etiqueta de tinte registrando formalmente el origen del evento.
+    /// El tinte es monotónicamente creciente: una vez contaminado, no puede limpiarse.
+    pub fn apply_taint(&mut self, new_tag: TaintTag, source_descriptor: impl Into<String>) {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        self.taint = self.taint | new_tag;
+        self.taint_history.push(TaintEvent {
+            tag: new_tag,
+            source_descriptor: source_descriptor.into(),
+            timestamp_ns: now_ns,
+        });
     }
 
     /// Simula la lectura de un recurso clasificado en el filesystem (xattr/LSM hook).
     /// El tinte solo puede expandirse, nunca eliminarse por el propio proceso.
     pub fn contaminate_with(&mut self, new_tag: TaintTag) {
-        self.taint = self.taint | new_tag;
+        self.apply_taint(new_tag, "unspecified_source");
     }
 
     /// Retorna si el proceso posee alguna de las etiquetas críticas dadas.
     #[inline]
     pub fn has_taint(&self, tag: TaintTag) -> bool {
         self.taint.intersects(tag)
+    }
+
+    /// Retorna un resumen formateado de los orígenes de la mancha.
+    pub fn format_taint_sources(&self) -> String {
+        if self.taint_history.is_empty() {
+            return "none".to_string();
+        }
+        let descriptors: Vec<&str> = self
+            .taint_history
+            .iter()
+            .map(|e| e.source_descriptor.as_str())
+            .collect();
+        descriptors.join(", ")
     }
 }

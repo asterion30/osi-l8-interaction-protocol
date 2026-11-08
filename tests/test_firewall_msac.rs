@@ -236,3 +236,110 @@ fn test_firewall_audit_log_ring_buffer_bounded() {
     // Debe mantenerse exactamente acotado a 3 elementos sin fuga de memoria
     assert_eq!(firewall.audit_log.len(), 3);
 }
+
+#[test]
+fn test_policy_from_conf_str_valid_and_roundtrip() {
+    let conf_data = r#"
+# Sovereign Policy File
+user_did = did:key:z6MkhaXgBZDvotDkL5257faiz48xzpq9999
+max_budget_cap = 42000
+max_autonomy_tier = 2
+max_deadline_ms = 12000
+require_sandbox_above_tier = 1
+deny_external_egress_if_tainted = true
+blacklist_skill = 0xDEADBEEF00000001
+blacklist_skill = 0x123456789ABCDEF0
+whitelist_skill = 0xCAFEBABE11223344
+"#;
+
+    let policy = UserGovernancePolicy::from_conf_str(conf_data).expect("Parse .conf válido");
+    assert_eq!(
+        policy.user_did,
+        "did:key:z6MkhaXgBZDvotDkL5257faiz48xzpq9999"
+    );
+    assert_eq!(policy.max_budget_cap, 42000);
+    assert_eq!(policy.max_autonomy_tier, 2);
+    assert_eq!(policy.max_deadline_ms, 12000);
+    assert_eq!(policy.require_sandbox_above_tier, 1);
+    assert!(policy.deny_external_egress_if_tainted);
+    assert!(policy.is_skill_forbidden(0xDEADBEEF00000001));
+    assert!(policy.is_skill_forbidden(0x123456789ABCDEF0));
+    assert!(!policy.is_skill_forbidden(0xCAFEBABE11223344));
+    // Cualquier otra habilidad no en la whitelist está prohibida
+    assert!(policy.is_skill_forbidden(0x9999_9999));
+
+    // Roundtrip de serialización
+    let serialized = policy.to_conf_string();
+    let re_parsed = UserGovernancePolicy::from_conf_str(&serialized).expect("Roundtrip parse");
+    assert_eq!(policy, re_parsed);
+}
+
+#[test]
+fn test_policy_from_conf_str_malformed_syntax_rejection() {
+    let bad_conf = "user_did did:key:missing_equals_sign";
+    let err = UserGovernancePolicy::from_conf_str(bad_conf).unwrap_err();
+    assert_eq!(err.line_number, 1);
+    assert!(err.message.contains("Sintaxis inválida"));
+
+    let bad_tier = "max_autonomy_tier = 65";
+    let err2 = UserGovernancePolicy::from_conf_str(bad_tier).unwrap_err();
+    assert_eq!(err2.line_number, 1);
+    assert!(err2.message.contains("excede el límite"));
+}
+
+#[test]
+fn test_default_msac_conf_file_is_valid() {
+    let conf_content = include_str!("../policies/default_msac.conf");
+    let policy = UserGovernancePolicy::from_conf_str(conf_content)
+        .expect("El archivo policies/default_msac.conf debe ser válido");
+    assert_eq!(policy.max_budget_cap, 50000);
+    assert_eq!(policy.max_autonomy_tier, 3);
+    assert!(policy.is_skill_forbidden(0xDEADBEEF00000001));
+}
+
+#[test]
+fn test_taint_source_descriptor_traceability_in_audit_record() {
+    let policy = build_clean_policy();
+    let mut firewall = CognitiveFirewall::new(policy);
+
+    let mut proc = ProcessTaintContext::new(777, "diagnostic-worker", true);
+    // Aplicamos tinte registrando el origen exacto del archivo o herramienta
+    proc.apply_taint(
+        TaintTag::MEDICAL_PII,
+        "read:/var/lib/hospital/oncology_records.db",
+    );
+
+    let packet = IpduPacket::propose_intent(
+        0x1234,
+        0xABCD,
+        1,
+        10_000,
+        5_000,
+        CognitivePolicyFlags::EMPTY,
+        0x9999,
+        "export clinical diagnosis to public peer",
+    )
+    .unwrap();
+
+    let decision = firewall.inspect_egress(&proc, &packet);
+    assert_eq!(decision.verdict, Verdict::Drop);
+    assert_eq!(
+        decision.error_code,
+        Some(CognitiveErrorCode::EpermCognitivePolicy)
+    );
+
+    // Verificamos que el AuditRecord y reason contengan el descriptor de origen
+    let audit = &decision.audit_record;
+    assert!(
+        audit
+            .reason
+            .contains("read:/var/lib/hospital/oncology_records.db"),
+        "El log forense debe incluir el descriptor de origen: {}",
+        audit.reason
+    );
+    assert_eq!(proc.taint_history.len(), 1);
+    assert_eq!(
+        proc.taint_history[0].source_descriptor,
+        "read:/var/lib/hospital/oncology_records.db"
+    );
+}
