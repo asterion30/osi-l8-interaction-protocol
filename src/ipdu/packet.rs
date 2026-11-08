@@ -98,6 +98,19 @@ impl IpduPacket {
         (self.header, self.payload)
     }
 
+    /// Actualiza el campo de firma/MAC `user_rule_sig_hash` de la cabecera.
+    #[inline]
+    pub fn set_user_rule_sig_hash(&mut self, sig_hash: u64) {
+        self.header.user_rule_sig_hash = sig_hash;
+    }
+
+    /// Retorna una copia del paquete con el `user_rule_sig_hash` actualizado.
+    #[inline]
+    pub fn with_user_rule_sig_hash(mut self, sig_hash: u64) -> Self {
+        self.header.user_rule_sig_hash = sig_hash;
+        self
+    }
+
     /// Longitud total del paquete serializado en bytes.
     #[inline]
     pub fn wire_len(&self) -> usize {

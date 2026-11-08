@@ -397,3 +397,306 @@ fn test_mcp_proxy_concurrent_clients_same_id() {
         "Todos los clientes concurrentes deben haber ejecutado exitosamente sin confusión de sesión"
     );
 }
+
+#[test]
+fn test_mcp_proxy_slowloris_deadline_rejection() {
+    let mock_server = MockToolServer::spawn();
+    let gateway = McpGatewayServer::start(
+        "127.0.0.1:0",
+        mock_server.addr.clone(),
+        SidecarConfig::default(),
+    )
+    .expect("Start gateway");
+
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
+        7000,
+        "SlowWorker",
+        false,
+    )));
+    let firewall = CognitiveFirewall::new(UserGovernancePolicy::default());
+
+    // Configurar timeout total de línea muy corto (150 ms)
+    let config = SidecarConfig {
+        io_timeout: Duration::from_millis(150),
+        ..Default::default()
+    };
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        taint_context,
+        config,
+    )
+    .expect("Start sidecar");
+
+    let mut stream = TcpStream::connect(&sidecar.addr).expect("Connect slow client");
+
+    // Enviar fragmentos goteados lentamente superando el deadline total acumulado sin emitir '\n'
+    let _ = stream.write_all(b"{\"json");
+    let _ = stream.flush();
+    thread::sleep(Duration::from_millis(60));
+
+    let _ = stream.write_all(b"rpc\":\"");
+    let _ = stream.flush();
+    thread::sleep(Duration::from_millis(60));
+
+    let _ = stream.write_all(b"2.0\"}");
+    let _ = stream.flush();
+    thread::sleep(Duration::from_millis(60));
+
+    // Intentar leer la respuesta de corte por timeout total
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line);
+
+    if !line.is_empty() {
+        let resp: serde_json::Value = serde_json::from_str(&line).expect("Valid JSON-RPC error");
+        assert_eq!(resp["error"]["code"], -32000);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("deadline exceeded"));
+    }
+}
+
+#[test]
+fn test_mcp_proxy_dynamic_auto_taint_ingress() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Bind diagnostic mock");
+    let mock_addr = listener.local_addr().unwrap().to_string();
+    listener.set_nonblocking(true).unwrap();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shut_clone = Arc::clone(&shutdown);
+
+    thread::spawn(move || {
+        while !shut_clone.load(Ordering::SeqCst) {
+            if let Ok((stream, _)) = listener.accept() {
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    let mut line = String::new();
+                    while let Ok(n) = reader.read_line(&mut line) {
+                        if n == 0 {
+                            break;
+                        }
+                        if let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": req.get("id").unwrap_or(&json!(1)),
+                                "result": {
+                                    "status": "success",
+                                    "payload": "PATIENT_RECORD: Acute oncology diagnosis with clinical notes"
+                                }
+                            });
+                            let mut resp_str = resp.to_string();
+                            resp_str.push('\n');
+                            let _ = writer.write_all(resp_str.as_bytes());
+                            let _ = writer.flush();
+                        }
+                        line.clear();
+                    }
+                });
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+
+    let gateway = McpGatewayServer::start("127.0.0.1:0", mock_addr, SidecarConfig::default())
+        .expect("Start gateway");
+
+    // Proceso inicialmente limpio pero configurado para bloquear salida externa si se mancha
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
+        8000,
+        "AutoTaintWorker",
+        true, // external egress
+    )));
+
+    let policy = UserGovernancePolicy {
+        deny_external_egress_if_tainted: true,
+        ..Default::default()
+    };
+    let firewall = CognitiveFirewall::new(policy);
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        Arc::clone(&taint_context),
+        SidecarConfig::default(),
+    )
+    .expect("Start sidecar");
+
+    // 1. PETICIÓN 1: Consulta médica legítima.
+    let req1 = json!({
+        "jsonrpc": "2.0",
+        "id": "query-med-01",
+        "method": "tools/call",
+        "params": {
+            "name": "get_patient_file",
+            "arguments": { "patient_id": 1042 }
+        }
+    });
+    let resp1 = send_mcp_request(&sidecar.addr, &req1);
+    assert!(resp1.get("result").is_some());
+
+    // Verificar que el Sidecar detectó dinámicamente datos médicos y se auto-manchó con MedicalPii
+    {
+        let ctx = taint_context.lock().unwrap();
+        assert!(
+            ctx.has_taint(TaintTag::MEDICAL_PII),
+            "El proceso debe haberse auto-manchado dinámicamente con MEDICAL_PII"
+        );
+    }
+
+    // 2. PETICIÓN 2: Intento posterior del agente de emitir tráfico externo.
+    let req2 = json!({
+        "jsonrpc": "2.0",
+        "id": "egress-after-taint",
+        "method": "tools/call",
+        "params": {
+            "name": "external_sync",
+            "arguments": { "data": "sync" }
+        }
+    });
+    let resp2 = send_mcp_request(&sidecar.addr, &req2);
+
+    // Debe ser bloqueado AUTOMÁTICAMENTE por Paso 1 MSAC (Taint Drop)
+    assert!(
+        resp2.get("error").is_some(),
+        "La petición subsiguiente debió ser bloqueada por Taint"
+    );
+    assert_eq!(resp2["error"]["verdict"], "Drop");
+    assert_eq!(resp2["error"]["code"], -32000);
+
+    shutdown.store(true, Ordering::SeqCst);
+}
+
+#[test]
+fn test_mcp_proxy_backend_down_error_propagation() {
+    // Gateway apuntando a un puerto donde NADA escucha (backend caído / connection refused)
+    let gateway = McpGatewayServer::start(
+        "127.0.0.1:0",
+        "127.0.0.1:49876".to_string(),
+        SidecarConfig::default(),
+    )
+    .expect("Start gateway");
+
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(9000, "Worker", false)));
+    let firewall = CognitiveFirewall::new(UserGovernancePolicy::default());
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        taint_context,
+        SidecarConfig::default(),
+    )
+    .expect("Start sidecar");
+
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": "req-backend-down",
+        "method": "tools/call",
+        "params": {
+            "name": "calc",
+            "arguments": { "op": "add" }
+        }
+    });
+
+    let resp = send_mcp_request(&sidecar.addr, &req);
+
+    // El Gateway debió responder con código de error estructurado -32002
+    assert!(
+        resp.get("error").is_some(),
+        "Debe recibir error cuando el backend está caído"
+    );
+    assert_eq!(resp["error"]["code"], -32002);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Backend tool server unreachable"));
+}
+
+#[test]
+fn test_mcp_proxy_psk_mac_authentication_and_tamper_rejection() {
+    let mock_server = MockToolServer::spawn();
+    let psk = [0x5Au8; 16];
+
+    let gateway_config = SidecarConfig {
+        psk: Some(psk),
+        ..Default::default()
+    };
+    let gateway = McpGatewayServer::start("127.0.0.1:0", mock_server.addr.clone(), gateway_config)
+        .expect("Start gateway");
+
+    let sidecar_config = SidecarConfig {
+        psk: Some(psk),
+        ..Default::default()
+    };
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
+        9900,
+        "PskWorker",
+        false,
+    )));
+    let firewall = CognitiveFirewall::new(UserGovernancePolicy::default());
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        taint_context,
+        sidecar_config,
+    )
+    .expect("Start sidecar");
+
+    // 1. Petición legítima autenticada con PSK -> Éxito
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": "req-auth-01",
+        "method": "tools/call",
+        "params": {
+            "name": "echo_service",
+            "arguments": { "auth": "verified" }
+        }
+    });
+    let resp = send_mcp_request(&sidecar.addr, &req);
+    assert!(
+        resp.get("result").is_some(),
+        "Petición autenticada con PSK debe tener éxito: {:?}",
+        resp
+    );
+
+    // 2. Intento de inyectar directamente al Gateway un paquete sin MAC válido
+    let gateway_stream = TcpStream::connect(&gateway.addr).expect("Connect directly to gateway");
+    let mut ilp_stream = ilp_core::transport::IlpStream::new(gateway_stream);
+
+    let forged_packet = ilp_core::ipdu::IpduPacket::propose_intent(
+        0x1234,
+        0x9999_8888,
+        1,
+        1000,
+        5000,
+        ilp_core::ipdu::CognitivePolicyFlags::EMPTY,
+        0xDEAD_BEEF, // MAC no coincide con la PSK
+        r#"{"jsonrpc":"2.0","id":"forged","method":"tools/call","params":{}}"#,
+    )
+    .unwrap();
+
+    ilp_stream
+        .send_packet(&forged_packet)
+        .expect("Send forged packet");
+    let resp_pkt = ilp_stream.recv_packet().expect("Receive rejection packet");
+
+    // Debe ser rechazado con Performative::RejectPolicy y código de autenticación -32001
+    assert_eq!(
+        resp_pkt.header().performative,
+        ilp_core::ipdu::Performative::RejectPolicy
+    );
+    let resp_json: serde_json::Value = serde_json::from_slice(resp_pkt.payload()).unwrap();
+    assert_eq!(resp_json["error"]["code"], -32001);
+    assert!(resp_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Frame MAC authentication failed"));
+}

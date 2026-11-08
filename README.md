@@ -78,7 +78,7 @@ El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento
 ## 🚀 Inicio Rápido (Quickstart)
 
 ```bash
-# 1. Ejecutar la suite completa de 47 pruebas de integración y unitarias
+# 1. Ejecutar la suite completa de 54 pruebas de integración y unitarias
 cargo test --all-targets --all-features
 
 # 2. Correr el benchmark formal reproducible y generar docs/BENCHMARK_RESULTS.md
@@ -143,7 +143,7 @@ La cabecera canónica I-PDU se estructura como un bloque binario alineado a 32 b
 
 ### Campos Clave de la Cabecera
 - **`SKILL_NAMESPACE_HASH` (64 bits):** Hash no criptográfico FNV-1a (o SimHash de intención) calculado sobre el identificador de la habilidad/herramienta (ej. `tools/call:calcular_riesgo`) para posibilitar enrutamiento y filtrado de políticas en $O(1)$ sin asignación en el heap.
-- **`USER_RULE_SIG_HASH` (64 bits):** Campo de 64 bits reservado como *placeholder* para firmas criptográficas de usuario (ej. Ed25519 o compromisos de atestación mTLS/DID) orientadas a la verificación de soberanía en capas de infraestructura.
+- **`USER_RULE_SIG_HASH` (64 bits):** Campo de 64 bits utilizado para autenticación de integridad de trama mediante SipHash-2-4 con clave pre-compartida (PSK de 128 bits, ver `src/ipdu/auth.rs`), así como *placeholder* para firmas criptográficas de usuario (ej. Ed25519 o compromisos de atestación mTLS/DID) orientadas a la verificación de soberanía en capas de infraestructura.
 - **`NEGOTIATION_SESSION_UUID` (64 bits):** Identificador unívoco de la conversación agéntica derivado determinísticamente del identificador de llamada o del handshake inicial.
 
 ### Performativas del Protocolo (Speech Acts de 6 bits)
@@ -246,7 +246,8 @@ osi-l8-interaction-protocol/
 │   │   ├── flags.rs                                      # CognitivePolicyFlags (16 bits)
 │   │   ├── performatives.rs                              # Speech acts (Discover, Propose, Commit, Attest, Reject)
 │   │   ├── header.rs                                     # IpduHeader e IpduError
-│   │   └── packet.rs                                     # IpduPacket y Length-Prefix bounds checking
+│   │   ├── packet.rs                                     # IpduPacket y Length-Prefix bounds checking
+│   │   └── auth.rs                                       # Autenticación de integridad SipHash-2-4 con PSK 128-bit
 │   ├── governance/                                       # Firewall Cognitivo (MSAC / CRM)
 │   │   ├── taint.rs                                      # TaintTag, TaintEvent, ProcessTaintContext
 │   │   ├── policy.rs                                     # UserGovernancePolicy y parser .conf
@@ -256,17 +257,19 @@ osi-l8-interaction-protocol/
 │   │   ├── mod.rs                                        # IlpStream sobre sockets TCP / Read+Write
 │   │   └── session.rs                                    # IlpSession y FSM de 3-Way Intent Handshake
 │   ├── bin/
-│   │   └── ilp_mcp_sidecar.rs                            # Daemon autónomo CLI de producción MCP Sidecar
+│   │   ├── ilp_mcp_sidecar.rs                            # Daemon autónomo CLI de producción MCP Sidecar
+│   │   └── ilp_mcp_gateway.rs                            # Daemon autónomo CLI de producción MCP Gateway
 │   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway)
 │   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 47 tests de integración y verificación E2E
+├── tests/                                                # 54 tests de integración y verificación E2E
 │   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking y simetría binaria (9 tests)
 │   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC (14 tests)
 │   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (7 tests)
 │   ├── test_tcp_transport.rs                             # Sockets TCP reales y contención OOM (4 tests)
 │   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
-│   ├── test_mcp_bridge.rs                                # Mapeo estricto, correlación con TTL y aislamiento (9 tests)
-│   └── test_mcp_proxy_e2e.rs                             # Túnel binario MCP E2E: Zero-Connect, cota 64 KiB y concurrencia (3 tests)
+│   ├── test_mcp_bridge.rs                                # Mapeo estricto, correlación con TTL, purga e in-flight (11 tests)
+│   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: Zero-Connect, cota 64 KiB, Slowloris, PSK MAC (7 tests)
+│   └── test_cli_binaries.rs                              # Smoke tests subprocess de CLI Gateway y Sidecar (4 tests)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
     ├── live_agent_proxy.rs                               # Comunicación en vivo entre 2 agentes por TCP

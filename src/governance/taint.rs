@@ -73,6 +73,23 @@ impl TaintTag {
     pub const fn intersects(&self, other: Self) -> bool {
         (self.0 & other.0) != 0
     }
+
+    /// Parsea una etiqueta de tinte a partir de su nombre canónico (insensible a mayúsculas).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "medical_pii" | "medical" | "medicalpii" => Some(Self::MEDICAL_PII),
+            "financial_data" | "financial_secret" | "financial" | "financialsecret" => {
+                Some(Self::FINANCIAL_DATA)
+            }
+            "biometric_data" | "biometric" | "biometricdata" => Some(Self::BIOMETRIC_DATA),
+            "credentials" | "creds" | "credential" => Some(Self::CREDENTIALS),
+            "government_id" | "govid" | "gov_id" => Some(Self::GOVERNMENT_ID),
+            "confidential_ip" | "ip" | "confidentialip" => Some(Self::CONFIDENTIAL_IP),
+            "all_sensitive" | "all" => Some(Self::ALL_SENSITIVE),
+            "clean" | "none" => Some(Self::CLEAN),
+            _ => None,
+        }
+    }
 }
 
 impl BitOr for TaintTag {

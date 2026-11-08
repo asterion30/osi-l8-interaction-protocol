@@ -63,6 +63,12 @@ pub enum McpBridgeError {
     UnmatchedResponseUuid,
     /// La tabla de correlación ha alcanzado su capacidad máxima permitida.
     CapacityExceeded,
+    /// Identificador de petición duplicado ya en vuelo para la misma conexión.
+    DuplicateInFlightRequestId,
+    /// La sesión agéntica ha expirado (TTL superado).
+    SessionExpired,
+    /// Fallo de autenticación MAC en trama I-PDU.
+    AuthFailed(String),
 }
 
 impl From<IpduError> for McpBridgeError {
@@ -82,6 +88,18 @@ impl fmt::Display for McpBridgeError {
             }
             Self::CapacityExceeded => {
                 write!(f, "Capacidad máxima de correlación de sesiones excedida")
+            }
+            Self::DuplicateInFlightRequestId => {
+                write!(
+                    f,
+                    "Identificador de petición ya se encuentra activo en vuelo"
+                )
+            }
+            Self::SessionExpired => {
+                write!(f, "La sesión agéntica ha expirado (TTL superado)")
+            }
+            Self::AuthFailed(msg) => {
+                write!(f, "Fallo de autenticación MAC en trama: {}", msg)
             }
         }
     }
@@ -153,11 +171,12 @@ impl McpRpcRequest {
 pub const MAX_PENDING_SESSIONS: usize = 1024;
 
 #[cfg(feature = "mcp")]
-/// Sesión agéntica pendiente de resolución con marca temporal para expiración.
+/// Sesión agéntica pendiente de resolución con marcas temporales para expiración.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingSession {
     pub session_uuid: u64,
     pub created_at: Instant,
+    pub expires_at: Instant,
 }
 
 #[cfg(feature = "mcp")]
@@ -206,7 +225,8 @@ impl McpSessionCorrelationTable {
     }
 
     /// Registra una nueva sesión pendiente asociada al cliente y su ID JSON-RPC.
-    /// Ejecuta `purge_expired` antes de insertar y rechaza si se supera `MAX_PENDING_SESSIONS`.
+    /// Ejecuta `purge_expired` antes de insertar y rechaza si se supera `MAX_PENDING_SESSIONS`
+    /// o si ya existe una petición idéntica activa en vuelo.
     pub fn register_session(
         &self,
         client_conn_id: u64,
@@ -221,7 +241,14 @@ impl McpSessionCorrelationTable {
         };
         let key = (client_conn_id, key_str);
 
+        let now = Instant::now();
         let mut map = self.sessions.lock().unwrap();
+        if let Some(existing) = map.get(&key) {
+            if now <= existing.expires_at {
+                return Err(McpBridgeError::DuplicateInFlightRequestId);
+            }
+        }
+
         if map.len() >= MAX_PENDING_SESSIONS && !map.contains_key(&key) {
             return Err(McpBridgeError::CapacityExceeded);
         }
@@ -231,14 +258,15 @@ impl McpSessionCorrelationTable {
             key,
             PendingSession {
                 session_uuid,
-                created_at: Instant::now(),
+                created_at: now,
+                expires_at: now + ttl,
             },
         );
         Ok(session_uuid)
     }
 
     /// Resuelve y retira (consume) la sesión registrada, validando estrictamente que el
-    /// UUID recibido en la cabecera I-PDU entrante coincida con el registrado.
+    /// UUID recibido en la cabecera I-PDU entrante coincida con el registrado y que no haya expirado.
     pub fn resolve_session(
         &self,
         client_conn_id: u64,
@@ -251,12 +279,17 @@ impl McpSessionCorrelationTable {
         };
         let key = (client_conn_id, key_str);
 
+        let now = Instant::now();
         let mut map = self.sessions.lock().unwrap();
         match map.get(&key) {
             Some(pending) if pending.session_uuid == incoming_session_uuid => {
-                let uuid = pending.session_uuid;
+                let is_expired = now > pending.expires_at;
                 map.remove(&key);
-                Ok(uuid)
+                if is_expired {
+                    Err(McpBridgeError::SessionExpired)
+                } else {
+                    Ok(incoming_session_uuid)
+                }
             }
             Some(_) => Err(McpBridgeError::UnmatchedResponseUuid),
             None => Err(McpBridgeError::UnmatchedResponseUuid),

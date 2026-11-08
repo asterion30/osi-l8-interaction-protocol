@@ -23,3 +23,8 @@ path = "src/main.rs"
 name = "ilp_mcp_sidecar"
 path = "src/bin/ilp_mcp_sidecar.rs"
 required-features = ["mcp"]
+
+[[bin]]
+name = "ilp_mcp_gateway"
+path = "src/bin/ilp_mcp_gateway.rs"
+required-features = ["mcp"]

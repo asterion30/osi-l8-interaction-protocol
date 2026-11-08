@@ -8,14 +8,15 @@ Este documento detalla la metodología, cobertura y resultados de la suite de pr
 
 | Módulo Evaluado | Archivo de Test | Pruebas | Resultado | Cobertura Funcional |
 | :--- | :--- | :---: | :---: | :--- |
-| **I-PDU Wire Format** | `tests/test_ipdu_wire.rs` | 9 | **100% PASS** | Empaquetado binario Big-Endian, Word 0 bitfields, cabecera canónica (36B), cabecera compacta (32B), defensa anti Allocation Bomb, rechazo estricto de bytes sobrantes (`TrailingBytes`) y bounds checking. |
+| **I-PDU Wire & Auth** | `tests/test_ipdu_wire.rs` + `src/ipdu/auth.rs` | 10 | **100% PASS** | Empaquetado binario Big-Endian, Word 0 bitfields, cabecera canónica (36B), cabecera compacta (32B), defensa anti Allocation Bomb, simetría binaria, y autenticación de integridad de trama con SipHash-2-4 y PSK 128-bit (`auth.rs`). |
 | **Cognitive Firewall (MSAC)** | `tests/test_firewall_msac.rs` | 14 | **100% PASS** | Pipeline MSAC de 3 pasos: Taint Tracking monotónico con encapsulamiento estricto, cobertura exhaustiva de todas las etiquetas sensibles (`ALL_SENSITIVE`), parser declarativo `.conf` con rechazo de duplicados y límites de tier (<= 63), límites O(1), DLP/Prompt Injection y Ring Buffer acotado. |
 | **Transport Session & FSM** | `tests/test_transport_fsm.rs` | 7 | **100% PASS** | Máquina de estados finita por roles (`SessionRole::Initiator` vs `SessionRole::Responder`), mutación atómica post-E/S, verificación estricta de `session_uuid`, plazos monotónicos dinámicos con `SetSocketTimeout`, timeout inicial contra Slowloris en `Responder`, y flujo completo de 5 pasos desde `DiscoverSkill` hasta `AttestResult` sobre TCP real. |
 | **TCP Sockets & Transport** | `tests/test_tcp_transport.rs` | 4 | **100% PASS** | Framing sobre streams TCP reales, contención de Allocation Bomb y serialización/deserialización en bucle. |
-| **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 9 | **100% PASS** | Mapeo estricto de llamadas MCP JSON-RPC (`tools/call` -> `ProposeIntent`, `tools/list` -> `DiscoverSkill`), respuestas (`AttestResult`/`RejectPolicy`), rechazo de métodos desconocidos (`UnsupportedMethod`), tabla de correlación con TTL, cota máxima (1024) y aislamiento de clientes. |
-| **MCP Proxy E2E Enforcement** | `tests/test_mcp_proxy_e2e.rs` | 3 | **100% PASS** | Servidores de producción (`McpSidecarServer` + `McpGatewayServer`) con túnel 100% binario I-PDU sobre `IlpStream`. **Demostración de No-Ejecución y Zero-Connect**: peticiones bloqueadas (taint/prompt injection) jamás abren sockets TCP al gateway. Rechazo estricto de líneas >64 KiB y aislamiento concurrente de clientes con `id: 1`. |
+| **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 11 | **100% PASS** | Mapeo estricto de llamadas MCP JSON-RPC, respuestas y errores; rechazo de IDs en vuelo duplicados, expiración estricta en `resolve_session`, purga automática por TTL y cota fija (1024). |
+| **MCP Proxy E2E Enforcement** | `tests/test_mcp_proxy_e2e.rs` | 7 | **100% PASS** | Servidores de producción (`McpSidecarServer` + `McpGatewayServer`) con túnel 100% binario I-PDU. Demostración Zero-Connect, cota de línea 64 KiB, concurrencia atómica (CAS), anti-Slowloris con deadline total, auto-manchado dinámico por DLP en ingress, propagación de errores `-32002` y autenticación PSK con SipHash-2-4. |
+| **CLI Production Binaries** | `tests/test_cli_binaries.rs` | 4 | **100% PASS** | Subprocesos reales de `ilp_mcp_sidecar` e `ilp_mcp_gateway`: flags `--check-config`, guardrail de red no-loopback y flujo E2E completo autenticado por PSK. |
 | **Protocol Handshake** | `tests/test_handshake_simulation.rs` | 1 | **100% PASS** | Negociación completa del 3-Way Intent Handshake entre Cliente y Proveedor con auditoría en ambos firewalls. |
-| **Total General** | **7 Suites de Tests** | **47** | **47 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
+| **Total General** | **8 Suites + Unit Tests** | **54** | **54 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
 
 ---
 
@@ -127,13 +128,25 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
    - Valida el aislamiento estricto de clientes mediante clave compuesta `(client_conn_id, request_id)` y verificación de `session_uuid`.
 9. **`test_mcp_correlation_table_ttl_purging`**:
    - Valida la purga automática por TTL y la cota superior `MAX_PENDING_SESSIONS` (1024).
-10. **`test_mcp_proxy_e2e_real_enforcement`**:
+10. **`test_mcp_correlation_table_duplicate_in_flight`**:
+    - Valida que registrar una solicitud con un ID que ya está en vuelo para la misma conexión sea rechazado con `Err(McpBridgeError::DuplicateInFlightRequestId)`.
+11. **`test_mcp_correlation_table_session_expired_on_resolve`**:
+    - Valida que resolver una sesión que ha superado su plazo de expiración (`expires_at`) falle con `Err(McpBridgeError::SessionExpired)`.
+12. **`test_mcp_proxy_e2e_real_enforcement`**:
     - Levanta servidores de producción `McpSidecarServer` y `McpGatewayServer` comunicándose por `IlpStream`.
     - **Demostración de No-Ejecución y Zero-Connect**: ante bloqueos (tinte médico o prompt injection), el gateway jamás acepta conexiones TCP adicionales (`accepted_connections == 1`) y la herramienta física jamás recibe tráfico.
-11. **`test_mcp_proxy_line_length_rejection`**:
+13. **`test_mcp_proxy_line_length_rejection`**:
     - Valida que líneas JSON-RPC de tamaño superior a 64 KiB sean rechazadas antes de conectar con el gateway (`accepted_connections == 0`).
-12. **`test_mcp_proxy_concurrent_clients_same_id`**:
+14. **`test_mcp_proxy_concurrent_clients_same_id`**:
     - Valida la ausencia de colisiones y cross-talk cuando múltiples clientes concurrentes utilizan el mismo identificador (`"id": 1`).
+15. **`test_mcp_proxy_slowloris_deadline_rejection`**:
+    - Valida la defensa contra ataques Slowloris mediante `read_bounded_line_with_deadline`, ajustando el timeout de socket al tiempo global remanente y abortando con error `-32000` si se supera el deadline total.
+16. **`test_mcp_proxy_dynamic_auto_taint_ingress`**:
+    - Demuestra el auto-manchado dinámico en el Sidecar: cuando una herramienta responde con datos médicos confidenciales, `HeuristicGatekeeper::detect_sensitive_classes` detecta la clase y mancha automáticamente el contexto del proceso, bloqueando de forma instantánea cualquier llamada externa posterior.
+17. **`test_mcp_proxy_backend_down_error_propagation`**:
+    - Valida que cuando el servidor de herramientas de backend está inalcanzable, el Gateway captura el error de conexión y responde con un error estructurado JSON-RPC `-32002` ("Backend tool server unreachable").
+18. **`test_mcp_proxy_psk_mac_authentication_and_tamper_rejection`**:
+    - Valida el flujo autenticado extremo a extremo con PSK de 128 bits calculando el MAC con SipHash-2-4, y comprueba que un intento de inyectar directamente tramas con MAC inválido al Gateway es rechazado con `Performative::RejectPolicy` y código `-32001`.
 
 ---
 
@@ -147,6 +160,19 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
 
 ---
 
+### 2.6. Binarios CLI de Producción (`tests/test_cli_binaries.rs`)
+
+1. **`test_sidecar_check_config_valid_and_invalid`**:
+   - Valida la opción `--check-config` en `ilp_mcp_sidecar`: retorna código de salida 0 con política válida y código de error ante archivos inexistentes.
+2. **`test_gateway_check_config`**:
+   - Valida la opción `--check-config` en `ilp_mcp_gateway` con configuración y clave PSK válidas.
+3. **`test_binaries_non_loopback_security_guardrail`**:
+   - Valida que intentar enlazar `ilp_mcp_sidecar` o `ilp_mcp_gateway` a interfaces no-loopback (`0.0.0.0`) sin especificar `--allow-non-loopback` y `--psk` sea bloqueado de inmediato con error fatal.
+4. **`test_full_binary_e2e_authenticated_flow`**:
+   - Levanta subprocesos reales e independientes de `ilp_mcp_gateway` e `ilp_mcp_sidecar` con autenticación PSK, ejecuta una llamada JSON-RPC real a través de los binarios compilados y valida la respuesta exitosa.
+
+---
+
 ## 3. Instrucciones de Reproducción
 
 ```bash
@@ -155,5 +181,5 @@ cargo test --all-targets --all-features
 
 Salida esperada:
 ```text
-test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```

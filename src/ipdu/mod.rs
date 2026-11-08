@@ -1,10 +1,12 @@
 //! RFC-ILP-2026: Interaction Protocol Data Unit (I-PDU) Module
 
+pub mod auth;
 pub mod flags;
 pub mod header;
 pub mod packet;
 pub mod performatives;
 
+pub use auth::{compute_frame_mac, verify_frame_mac};
 pub use flags::CognitivePolicyFlags;
 pub use header::{
     IpduError, IpduHeader, CANONICAL_HEADER_SIZE, COMPACT_256BIT_HEADER_SIZE, ILP_VERSION_1,

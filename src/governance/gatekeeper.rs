@@ -145,4 +145,81 @@ impl HeuristicGatekeeper {
         }
         sum % 10 == 0
     }
+
+    /// Escanea un payload arbitrario (ej. respuesta de herramienta o recurso) e identifica
+    /// clases de datos sensibles para auto-manchado dinámico (Taint Ingress Tracking).
+    pub fn detect_sensitive_classes(payload: &[u8]) -> Vec<crate::governance::taint::TaintTag> {
+        use crate::governance::taint::TaintTag;
+
+        let Ok(text) = std::str::from_utf8(payload) else {
+            return Vec::new();
+        };
+        let lower = text.to_lowercase();
+        let mut tags = Vec::new();
+
+        // 1. Datos Médicos / Pacientes (HIPAA / GDPR Especial)
+        if lower.contains("patient_record")
+            || lower.contains("patient record")
+            || lower.contains("historia_clinica")
+            || lower.contains("paciente")
+            || lower.contains("medical")
+            || lower.contains("oncology")
+            || lower.contains("diagnosis")
+            || lower.contains("diagnóstico")
+            || lower.contains("myocardial")
+            || lower.contains("blood_pressure")
+            || lower.contains("prescription")
+        {
+            tags.push(TaintTag::MEDICAL_PII);
+        }
+
+        // 2. Datos Financieros / Cuentas / Secretos
+        if Self::find_credit_card_candidate(text).is_some()
+            || lower.contains("iban:")
+            || lower.contains("financial_secret")
+            || lower.contains("bank_account")
+            || lower.contains("cuenta_bancaria")
+            || lower.contains("credit_card")
+        {
+            tags.push(TaintTag::FINANCIAL_DATA);
+        }
+
+        // 3. Datos Biométricos
+        if lower.contains("biometric")
+            || lower.contains("fingerprint")
+            || lower.contains("dna_sequence")
+            || lower.contains("facial_recognition")
+            || lower.contains("huella_dactilar")
+        {
+            tags.push(TaintTag::BIOMETRIC_DATA);
+        }
+
+        // 4. Credenciales de acceso
+        if text.contains("sk-")
+            || text.contains("ghp_")
+            || text.contains("Bearer ")
+            || text.contains("PRIVATE KEY")
+        {
+            tags.push(TaintTag::CREDENTIALS);
+        }
+
+        // 5. Identificación Gubernamental
+        if lower.contains("ssn:")
+            || lower.contains("dni:")
+            || lower.contains("pasaporte:")
+            || lower.contains("passport:")
+        {
+            tags.push(TaintTag::GOVERNMENT_ID);
+        }
+
+        // 6. Propiedad Intelectual Confidencial
+        if lower.contains("confidential_ip")
+            || lower.contains("proprietary_code")
+            || lower.contains("trade_secret")
+        {
+            tags.push(TaintTag::CONFIDENTIAL_IP);
+        }
+
+        tags
+    }
 }

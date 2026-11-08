@@ -55,11 +55,11 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 # Compilar la biblioteca y binarios
 cargo build
 
-# Ejecutar la suite completa de tests unitarios y de integración (47 tests)
+# Ejecutar la suite completa de tests unitarios y de integración (54 tests)
 cargo test --all-targets --all-features
 
 # Comprobar análisis estático sin advertencias
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ### Ejecutar la Demostración de Red en Vivo (Multi-Agente)
@@ -205,31 +205,102 @@ def agent_egress_hook(tool_call):
 ### Entorno E: Adaptador y Proxy Sidecar para Model Context Protocol (MCP)
 El módulo `ilp_core::bridge` permite proteger llamadas MCP JSON-RPC (`tools/call`, `prompts/get`) activando el feature opcional `mcp`.
 
-#### 1. Binario de Producción Autónomo (`ilp_mcp_sidecar`)
-El proyecto incluye un daemon independiente y configurable en `src/bin/ilp_mcp_sidecar.rs`:
+#### 1. Modelo de Amenazas y Confinamiento de Red Obligatorio (Non-Evasible Enforcement)
+
+> [!IMPORTANT]
+> **Naturaleza del Proxy Sidecar:** El `ilp_mcp_sidecar` opera como un **proxy a nivel de aplicación**. Un agente de IA cooperativo configurará su cliente MCP para conectarse a `127.0.0.1:9001` (puerto del sidecar). Sin embargo, un agente malicioso, comprometido o no cooperativo podría intentar evadir el firewall conectándose directamente al gateway o emitiendo paquetes hacia la red externa.
+
+Para garantizar un **control de acceso obligatorio e ineludible (Non-Evasible Enforcement)** en producción, el entorno debe imponer aislamiento a nivel de kernel mediante Linux Network Namespaces, Docker Containers o reglas de cortafuegos por UID (`iptables` / `nftables`):
 
 ```bash
-# Validar sintaxis y configuración sin iniciar el servidor
-cargo run --bin ilp_mcp_sidecar --features mcp -- --check-config --policy policies/default_msac.conf
+# 1. Crear usuario del sistema dedicado exclusivamente al daemon sidecar
+useradd -r -s /bin/false ilp-sidecar
 
-# Iniciar el daemon sidecar interceptando JSON-RPC en el puerto 9001 y enviando I-PDU al puerto 9002
-cargo run --bin ilp_mcp_sidecar --features mcp -- --listen 127.0.0.1:9001 --gateway 127.0.0.1:9002 --policy policies/default_msac.conf
+# 2. Permitir ÚNICAMENTE al usuario del sidecar tráfico saliente hacia el Gateway ILP (puerto 9002)
+iptables -A OUTPUT -m owner --uid-owner ilp-sidecar -d 127.0.0.1 -p tcp --dport 9002 -j ACCEPT
+
+# 3. Restringir la salida del usuario del agente (agent-user) exclusivamente al puerto ingress del sidecar (9001)
+iptables -A OUTPUT -m owner --uid-owner agent-user -d 127.0.0.1 -p tcp --dport 9001 -j ACCEPT
+
+# 4. Bloquear cualquier otra conexión TCP saliente del agente (impidiendo evasión directa)
+iptables -A OUTPUT -m owner --uid-owner agent-user -j DROP
 ```
 
-**Comportamiento Zero-Connect:** Ante cualquier solicitud que viole las políticas MSAC o el tinte, el sidecar responde inmediatamente con un error JSON-RPC y **jamás abre un socket TCP** hacia el gateway remoto. Además, limita estrictamente las líneas JSON-RPC entrantes a 64 KiB para prevenir ataques por agotamiento de memoria.
+En entornos con **Docker / Kubernetes**, se confina el runtime del agente en una red interna privada (`--internal` o NetworkPolicy sin egress directo) conectada exclusivamente al contenedor del sidecar.
 
-#### 2. Servidores Programáticos (`McpSidecarServer` y `McpGatewayServer`)
+#### 2. Autenticación Criptográfica de Trama con Clave Pre-compartida (PSK / SipHash-2-4)
+
+Para impedir la inyección directa de tramas I-PDU espurias contra el Gateway, ambos daemons (`ilp_mcp_sidecar` e `ilp_mcp_gateway`) soportan autenticación de integridad basada en SipHash-2-4 con clave de 128 bits (`--psk <HEX_KEY>`):
+- El Sidecar firma criptográficamente los primeros 28 bytes de la cabecera canónica + payload e inserta el MAC resultante en el campo `user_rule_sig_hash` de la cabecera.
+- El Gateway verifica la firma antes de procesar o despachar cualquier llamada al servidor de herramientas. Si la clave no coincide o la trama fue alterada, el Gateway responde con `Performative::RejectPolicy` y código JSON-RPC `-32001`.
+- **Guardrail de red no-loopback:** El enlace a interfaces de red externas (`0.0.0.0` o IPs públicas) está bloqueado por defecto; requiere la presencia explícita de `--allow-non-loopback` y una clave `--psk`.
+
+#### 3. Daemons de Producción Autónomos (`ilp_mcp_sidecar` y `ilp_mcp_gateway`)
+
+El proyecto provee dos binarios de línea de comandos independientes:
+
+- **`ilp_mcp_sidecar`**: Intercepta tráfico JSON-RPC del agente, audita con MSAC (Zero-Connect: jamás abre TCP al gateway si la política rechaza), auto-mancha dinámicamente el proceso ante respuestas con datos sensibles (`DLP Ingress`), firma tramas con PSK y maneja concurrencia atómica (CAS) sin condiciones de carrera.
+- **`ilp_mcp_gateway`**: Recibe paquetes binarios I-PDU del sidecar sobre `IlpStream`, verifica la autenticación PSK, despacha JSON-RPC al backend de herramientas MCP y propaga errores estructurados (`-32002`) si el backend está inalcanzable.
+
+```bash
+# Validar sintaxis y configuración sin iniciar los servidores (--check-config)
+cargo run --bin ilp_mcp_sidecar --features mcp -- --check-config --policy policies/default_msac.conf
+cargo run --bin ilp_mcp_gateway --features mcp -- --check-config --psk 00112233445566778899aabbccddeeff
+```
+
+#### 4. Guía de Despliegue en 3 Terminales (Quickstart)
+
+Sigue estos pasos para desplegar la arquitectura completa en terminales independientes:
+
+```bash
+# ------------------------------------------------------------------------------
+# TERMINAL 1: Servidor de Herramientas MCP Backend (ejemplo de escucha en 8080)
+# ------------------------------------------------------------------------------
+# Inicia tu servidor MCP estándar (o un mock en Python / Node.js escuchando en 127.0.0.1:8080)
+python3 -m http.server 8080   # o tu servidor MCP real: npx -y @modelcontextprotocol/server-everything
+
+# ------------------------------------------------------------------------------
+# TERMINAL 2: ILP MCP Gateway Daemon (recibe I-PDU en 9002 -> despacha a 8080)
+# ------------------------------------------------------------------------------
+cargo run --bin ilp_mcp_gateway --features mcp -- \
+    --listen 127.0.0.1:9002 \
+    --backend 127.0.0.1:8080 \
+    --psk 00112233445566778899aabbccddeeff
+
+# ------------------------------------------------------------------------------
+# TERMINAL 3: ILP MCP Sidecar Daemon (recibe JSON-RPC en 9001 -> reenvía a 9002)
+# ------------------------------------------------------------------------------
+cargo run --bin ilp_mcp_sidecar --features mcp -- \
+    --listen 127.0.0.1:9001 \
+    --gateway 127.0.0.1:9002 \
+    --policy policies/default_msac.conf \
+    --psk 00112233445566778899aabbccddeeff \
+    --initial-taint MedicalPii,Credentials
+
+# ------------------------------------------------------------------------------
+# TERMINAL 4: Agente / Cliente MCP (Prueba interactiva)
+# ------------------------------------------------------------------------------
+# El agente se conecta al puerto del Sidecar (9001) como si fuera el servidor MCP:
+echo '{"jsonrpc":"2.0","id":"req-01","method":"tools/call","params":{"name":"query_records","arguments":{}}}' | nc 127.0.0.1 9001
+```
+
+#### 5. Servidores Programáticos en Rust (`McpSidecarServer` y `McpGatewayServer`)
 ```rust
 use ilp_core::bridge::{McpGatewayServer, McpSidecarServer, SidecarConfig};
 
-// Gateway ILP: Recibe paquetes binarios I-PDU y despacha JSON-RPC al servidor de herramientas local
-let gateway = McpGatewayServer::start("127.0.0.1:9002", "127.0.0.1:8080".to_string(), SidecarConfig::default())?;
+let config = SidecarConfig {
+    psk: Some([0x42; 16]), // Clave de 128 bits
+    ..Default::default()
+};
 
-// Sidecar MCP: Intercepta JSON-RPC, audita con MSAC (Zero-Connect) y reenvía tramas binarias al Gateway
-let sidecar = McpSidecarServer::start("127.0.0.1:9001", gateway.addr.clone(), firewall, taint_context, SidecarConfig::default())?;
+// Gateway ILP: Recibe paquetes binarios I-PDU y despacha JSON-RPC al servidor de herramientas local
+let gateway = McpGatewayServer::start("127.0.0.1:9002", "127.0.0.1:8080".to_string(), config.clone())?;
+
+// Sidecar MCP: Intercepta JSON-RPC, audita con MSAC (Zero-Connect) y reenvía tramas binarias autenticadas
+let sidecar = McpSidecarServer::start("127.0.0.1:9001", gateway.addr.clone(), firewall, taint_context, config)?;
 ```
 
-#### 3. Demostración Interactiva del Escudo MCP
+#### 6. Demostración Interactiva del Escudo MCP
 Para probar el demo interactivo:
 ```bash
 cargo run --example mcp_shield_demo --features mcp

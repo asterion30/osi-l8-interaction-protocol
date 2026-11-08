@@ -240,3 +240,55 @@ fn test_mcp_correlation_table_ttl_purging() {
     table.purge_expired(ttl);
     assert!(table.is_empty());
 }
+
+#[test]
+fn test_mcp_correlation_table_duplicate_in_flight() {
+    use ilp_core::bridge::{McpBridgeError, McpSessionCorrelationTable};
+    use std::time::Duration;
+
+    let table = McpSessionCorrelationTable::new();
+    let ttl = Duration::from_secs(10);
+    let client_id = 42;
+    let req_id = json!("req-dup-01");
+
+    let uuid1 = table
+        .register_session(client_id, &req_id, ttl)
+        .expect("First registration must succeed");
+    assert_ne!(uuid1, 0);
+
+    // Re-registrar el mismo request_id activo en vuelo debe rechazarse
+    let err = table
+        .register_session(client_id, &req_id, ttl)
+        .expect_err("Duplicate in-flight request ID must be rejected");
+    assert_eq!(err, McpBridgeError::DuplicateInFlightRequestId);
+
+    // Pero otro cliente con el mismo ID no debe ser rechazado
+    let other_client = 99;
+    assert!(table.register_session(other_client, &req_id, ttl).is_ok());
+}
+
+#[test]
+fn test_mcp_correlation_table_session_expired_on_resolve() {
+    use ilp_core::bridge::{McpBridgeError, McpSessionCorrelationTable};
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let table = McpSessionCorrelationTable::new();
+    let ttl = Duration::from_millis(15);
+    let client_id = 1;
+    let req_id = json!("req-expire-me");
+
+    let uuid = table
+        .register_session(client_id, &req_id, ttl)
+        .expect("Registration must succeed");
+
+    // Esperar a que supere el TTL
+    sleep(Duration::from_millis(25));
+
+    // Resolver antes de que ocurra purge_expired debe fallar con SessionExpired
+    let res = table.resolve_session(client_id, &req_id, uuid);
+    assert_eq!(res, Err(McpBridgeError::SessionExpired));
+
+    // La entrada debe haber sido consumida / retirada
+    assert!(table.is_empty());
+}

@@ -12,6 +12,6 @@ pub use mcp_adapter::{fnv1a_64, McpBridge, McpBridgeError};
 pub use mcp_adapter::{McpRpcRequest, McpRpcResponse, McpSessionCorrelationTable};
 #[cfg(feature = "mcp")]
 pub use proxy::{
-    ClientIngressResult, IlpMcpGateway, McpGatewayServer, McpProxyRelay, McpSidecarServer,
-    SidecarConfig,
+    read_bounded_line_with_deadline, ClientIngressResult, ConnectionPermit, GatewayConfig,
+    IlpMcpGateway, McpGatewayServer, McpProxyRelay, McpSidecarServer, ProxyError, SidecarConfig,
 };
