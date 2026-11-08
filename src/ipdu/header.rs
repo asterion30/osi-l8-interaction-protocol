@@ -215,11 +215,20 @@ pub enum IpduError {
     UnsupportedVersion(u8),
     InvalidAutonomyTier(u8),
     Performative(PerformativeError),
-    BufferUnderflow { expected: usize, actual: usize },
-    InvalidPayloadLength { declared: usize, actual: usize },
+    BufferUnderflow {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidPayloadLength {
+        declared: usize,
+        actual: usize,
+    },
     PayloadTooLarge(usize),
     ArithmeticOverflow,
-    TruncatedPayload { expected: usize, actual: usize },
+    TruncatedPayload {
+        expected: usize,
+        actual: usize,
+    },
     Io(String),
     ConnectionClosed,
     InvalidStateTransition {
@@ -231,6 +240,7 @@ pub enum IpduError {
         expected: u64,
         actual: u64,
     },
+    TrailingBytes(usize),
 }
 
 impl From<PerformativeError> for IpduError {
@@ -243,6 +253,11 @@ impl From<std::io::Error> for IpduError {
     fn from(err: std::io::Error) -> Self {
         if err.kind() == std::io::ErrorKind::UnexpectedEof {
             Self::ConnectionClosed
+        } else if matches!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            Self::DeadlineExpired
         } else {
             Self::Io(err.to_string())
         }
@@ -307,6 +322,13 @@ impl fmt::Display for IpduError {
                 "Discrepancia en session_uuid: esperado 0x{:016X}, recibido 0x{:016X}",
                 expected, actual
             ),
+            Self::TrailingBytes(extra) => {
+                write!(
+                    f,
+                    "Trama con bytes sobrantes tras el payload: {} bytes",
+                    extra
+                )
+            }
         }
     }
 }

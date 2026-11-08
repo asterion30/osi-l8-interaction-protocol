@@ -18,12 +18,12 @@ Para proporcionar total transparencia a auditores de seguridad, ingenieros de si
 
 | Componente del Protocolo | Estado de Madurez | Ubicación en el Repositorio |
 | :--- | :---: | :--- |
-| **Binary I-PDU Wire Framing (32B/36B)** | ✅ **Implemented & Fuzz-Tested** | [`src/ipdu/`](src/ipdu/) (Header, Packet, Word 0, Length-Prefix) |
-| **Userspace MSAC Semantic Firewall** | ✅ **Implemented & Auditable** | [`src/governance/`](src/governance/) (Pipeline de 3 pasos, Ring Buffer) |
-| **Monotonic Taint Tracking & Origin Traceability** | ✅ **Implemented** | [`src/governance/taint.rs`](src/governance/taint.rs) (`TaintEvent`, `source_descriptor`) |
+| **Binary I-PDU Wire Framing (32B/36B)** | ✅ **Implemented & Fuzz-Tested** | [`src/ipdu/`](src/ipdu/) (Header, Packet, Word 0, Length-Prefix, TrailingBytes check) |
+| **Userspace MSAC Semantic Firewall** | ✅ **Implemented & Auditable** | [`src/governance/`](src/governance/) (Pipeline de 3 pasos, Ring Buffer, HeuristicGatekeeper) |
+| **Monotonic Taint Tracking & Origin Traceability** | ✅ **Implemented** | [`src/governance/taint.rs`](src/governance/taint.rs) (`TaintEvent`, `source_descriptor`, private fields) |
 | **Zero-Deps Policy Engine (`.conf`)** | ✅ **Implemented** | [`src/governance/policy.rs`](src/governance/policy.rs), [`policies/default_msac.conf`](policies/default_msac.conf) |
-| **Stateful TCP Transport & 3-Way Handshake FSM** | ✅ **Implemented** | [`src/transport/`](src/transport/) (`IlpSession`, `SessionState`, timeouts) |
-| **MCP (JSON-RPC) Shield Adapter** | 🧪 **Proof of Concept** | [`src/bridge/`](src/bridge/) (`fnv1a`, wrapper de herramientas) |
+| **Stateful TCP Transport & 3-Way Handshake FSM** | ✅ **Implemented** | [`src/transport/`](src/transport/) (`SessionRole::Initiator` vs `Responder`, atomic mutation) |
+| **MCP (JSON-RPC) Shield Adapter & E2E Proxy** | ✅ **Implemented & Verified E2E** | [`src/bridge/`](src/bridge/), [`tests/test_mcp_proxy_e2e.rs`](tests/test_mcp_proxy_e2e.rs) (TCP proxy con prueba de no-ejecución) |
 | **Linux Kernel eBPF / LSM Socket Hooks** | 🗺️ **Architectural Specification (Roadmap)** | [`docs/ARCHITECTURE_SPEC.md`](docs/ARCHITECTURE_SPEC.md) (Fase 4 del estándar) |
 
 ---
@@ -31,11 +31,11 @@ Para proporcionar total transparencia a auditores de seguridad, ingenieros de si
 ## ⚠️ Assumptions & Known Limitations
 
 1. **Userspace Reference Monitor (No Ring 0 Yet):**  
-   En la versión actual (`v0.1.0`), el firewall semántico `CognitiveFirewall` y el contexto `ProcessTaintContext` se ejecutan como un **monitor de referencia en espacio de usuario** (*Userspace Reference Monitor / Sidecar Proxy*). No intercepta llamadas al sistema en Ring 0 a nivel de kernel todavía. La especificación formal para ganchos eBPF (`lsm/socket_sendmsg`, `bpf_lsm_file_open`) está detallada en [`docs/ARCHITECTURE_SPEC.md`](docs/ARCHITECTURE_SPEC.md).
+   En la versión actual (`v0.1.0`), el firewall semántico `CognitiveFirewall` y el contexto `ProcessTaintContext` se ejecutan como un **monitor de referencia cooperativo en espacio de usuario** (*Userspace Reference Monitor / Sidecar Proxy*). No intercepta llamadas al sistema en Ring 0 a nivel de kernel todavía. La especificación formal para ganchos eBPF (`lsm/socket_sendmsg`, `bpf_lsm_file_open`) está detallada en [`docs/ARCHITECTURE_SPEC.md`](docs/ARCHITECTURE_SPEC.md).
 2. **Taint Tracking en Espacio de Usuario:**  
-   La propagación de tinte depende de que el runtime o el proxy sidecar invoque `apply_taint(tag, descriptor)`. El aislamiento obligatorio contra procesos hostiles requiere confinamiento de contenedor (cgroups / seccomp / Firecracker) hasta que los hooks de kernel estén terminados.
-3. **SLM Gatekeeper Cuantizado:**  
-   El paso 3 del firewall utiliza heurísticas rápidas (< 500 ns) de entropía, regex precompilados y patrones adversariales para prevención de exfiltración e inyección de prompts, diseñado para ser complementado por un modelo SLM local en GPU/NPU cuando la latencia lo permita.
+   La propagación de tinte depende de que el runtime o el proxy sidecar invoque `apply_taint(tag, descriptor)`. El contexto encapsula estrictamente sus campos y bitmask haciéndolos inmutables/monotónicos desde código externo. El aislamiento contra procesos hostiles requiere confinamiento de contenedor (cgroups / seccomp / Firecracker) hasta que los hooks de kernel estén terminados.
+3. **SLM / Heuristic Gatekeeper:**  
+   El paso 3 del firewall utiliza heurísticas rápidas (< 500 ns) de entropía, validación de Luhn para números de tarjeta de crédito y patrones adversariales para prevención de exfiltración e inyección de prompts, diseñado para ser complementado por un modelo SLM local en GPU/NPU cuando la latencia lo permita.
 
 ---
 
@@ -55,9 +55,9 @@ Frente a la adopción generalizada de frameworks agénticos y protocolos de herr
 
 ---
 
-## 🔬 Benchmarks Científicamente Reproducibles (100,000 Muestras con Percentiles)
+## 🔬 Benchmarks Científicamente Reproducibles (100,000 Muestras Amortizadas)
 
-El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento (*warmup*) de 10,000 iteraciones, midiendo individualmente 100,000 iteraciones con `std::hint::black_box` en modo `--release`.
+El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento (*warmup*) de 10,000 iteraciones, midiendo en lotes amortizados de 100 operaciones por muestra (1,000 muestras = 100,000 operaciones totales) con `std::hint::black_box` en modo `--release`. La amortización por lotes elimina la distorsión del reloj del sistema (`vDSO clock_gettime` ~15-25 ns).
 
 - **Entorno de Prueba**: Linux `x86_64` (AMD FX-8320 Eight-Core Processor), Perfil de compilación: `release` optimizado con LLVM.
 - **Comando de Reproducción**: `./scripts/run_benchmarks.sh` o `cargo run --release --example benchmark_latency`.
@@ -65,19 +65,19 @@ El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento
 
 | Operación / Subsistema | Tamaño / Formato | Mediana (p50) | Percentil 95 (p95) | Percentil 99 (p99) | Máximo | Desviación Estándar (σ) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **I-PDU Header Parsing** | 36 Bytes (Canónico) | **70 ns** | 70 ns | 73 ns | 50.1 µs | ±196.1 ns |
-| **I-PDU Packet Wire Roundtrip** | 512B Payload | **155 ns** | 161 ns | 221 ns | 30.4 µs | ±165.1 ns |
-| **MSAC Semantic Firewall Egress** | 3 Pasos Completos | **996 ns** | 1.31 µs | 2.02 µs | 27.9 µs | ±451.7 ns |
-| **JSON-RPC String Scan (Baseline)** | 512B Texto Plano | **396 ns** | 438 ns | 519 ns | 31.0 µs | ±253.5 ns |
+| **I-PDU Header Parsing** | 36 Bytes (Canónico) | **26.9 ns** | 26.9 ns | 26.9 ns | 284.1 ns | ±8.1 ns |
+| **I-PDU Packet Wire Roundtrip** | 512B Payload | **112.6 ns** | 127.0 ns | 178.3 ns | 579.2 ns | ±25.9 ns |
+| **MSAC Semantic Firewall Egress** | 3 Pasos Completos | **908.6 ns** | 1.23 µs | 1.46 µs | 1.69 µs | ±120.2 ns |
+| **JSON-RPC String Scan (Baseline)** | 512B Texto Plano | **345.3 ns** | 372.1 ns | 557.6 ns | 903.0 ns | ±41.3 ns |
 
-> **Conclusión Estadística:** El parseo de cabeceras binarias I-PDU logra una mediana de latencia **~5.7x menor** que el escaneo manual de campos equivalentes en JSON-RPC, y el Firewall Cognitivo MSAC ejecuta su inspección en menos de un microsegundo (**p50 = 996 ns**).
+> **Overhead Absoluto del Monitor en Espacio de Usuario (ns/op):** El parseo binario I-PDU insume ~27 ns/op, y el Firewall Cognitivo MSAC ejecuta su inspección en menos de un microsegundo (**p50 = 908.6 ns**), garantizando contención estricta sin penalizar los tiempos de inferencia de los LLMs.
 
 ---
 
 ## 🚀 Inicio Rápido (Quickstart)
 
 ```bash
-# 1. Ejecutar la suite completa de 31 pruebas unitarias y de integración
+# 1. Ejecutar la suite completa de 40 pruebas de integración y unitarias
 cargo test --all-targets --all-features
 
 # 2. Correr el benchmark formal reproducible y generar docs/BENCHMARK_RESULTS.md
@@ -139,6 +139,11 @@ La cabecera canónica I-PDU se estructura como un bloque binario alineado a 32 b
 |    SEMANTIC PAYLOAD (0 .. 64 KB, acotado contra OOM)         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
+
+### Campos Clave de la Cabecera
+- **`SKILL_NAMESPACE_HASH` (64 bits):** Hash no criptográfico FNV-1a (o SimHash de intención) calculado sobre el identificador de la habilidad/herramienta (ej. `tools/call:calcular_riesgo`) para posibilitar enrutamiento y filtrado de políticas en $O(1)$ sin asignación en el heap.
+- **`USER_RULE_SIG_HASH` (64 bits):** Campo de 64 bits reservado como *placeholder* para firmas criptográficas de usuario (ej. Ed25519 o compromisos de atestación mTLS/DID) orientadas a la verificación de soberanía en capas de infraestructura.
+- **`NEGOTIATION_SESSION_UUID` (64 bits):** Identificador unívoco de la conversación agéntica derivado determinísticamente del identificador de llamada o del handshake inicial.
 
 ### Performativas del Protocolo (Speech Acts de 6 bits)
 1. `0x01` — `DISCOVER_SKILL`: Consulta semántica en la red.
@@ -251,13 +256,14 @@ osi-l8-interaction-protocol/
 │   │   └── session.rs                                    # IlpSession y FSM de 3-Way Intent Handshake
 │   ├── bridge/                                           # Escudo de compatibilidad con MCP JSON-RPC
 │   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 31 tests unitarios y de integración
-│   ├── test_ipdu_wire.rs                                 # Fuzz y roundtrip binario
-│   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC
-│   ├── test_transport_fsm.rs                             # Pruebas estrictas de la FSM de sesión y timeouts
-│   ├── test_tcp_transport.rs                             # Sockets TCP reales y cota OOM
-│   ├── test_handshake_simulation.rs                      # Simulación multi-turno
-│   └── test_mcp_bridge.rs                                # Envoltorio de herramientas MCP
+├── tests/                                                # 40 tests de integración y verificación E2E
+│   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking y simetría binaria (9 tests)
+│   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC (13 tests)
+│   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (5 tests)
+│   ├── test_tcp_transport.rs                             # Sockets TCP reales y contención OOM (4 tests)
+│   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
+│   ├── test_mcp_bridge.rs                                # Mapeo estricto de métodos y error types (7 tests)
+│   └── test_mcp_proxy_e2e.rs                             # Proxy TCP E2E con prueba de no-ejecución (1 test)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
     ├── live_agent_proxy.rs                               # Comunicación en vivo entre 2 agentes por TCP

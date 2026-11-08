@@ -1,4 +1,4 @@
-//! RFC-ILP-2026: Embedded SLM Gatekeeper Simulation (Deep Content & DLP Inspection)
+//! RFC-ILP-2026: Heuristic Gatekeeper (DLP & Semantic Threat Scanner)
 
 use std::fmt;
 
@@ -9,6 +9,7 @@ pub enum GatekeeperThreat {
     CredentialLeak(String),
     GovernmentIdLeak(String),
     PromptInjectionAttempt(String),
+    InvalidUtf8Encoding(String),
 }
 
 impl fmt::Display for GatekeeperThreat {
@@ -24,25 +25,41 @@ impl fmt::Display for GatekeeperThreat {
             Self::PromptInjectionAttempt(msg) => {
                 write!(f, "Inyección de Prompt / Jailbreak Cognitivo: {}", msg)
             }
+            Self::InvalidUtf8Encoding(msg) => {
+                write!(f, "Codificación UTF-8 inválida en payload: {}", msg)
+            }
         }
     }
 }
 
-/// Guardián SLM de borde: Realiza inspección heurística ultrarrápida (<5 ms) de DLP y seguridad cognitiva.
+/// Guardián heurístico de borde: Realiza inspección estricta y determinista de DLP y seguridad cognitiva.
 #[derive(Debug, Clone, Default)]
-pub struct SlmGatekeeper;
+pub struct HeuristicGatekeeper;
 
-impl SlmGatekeeper {
+/// Alias para mantener retrocompatibilidad con integraciones previas.
+#[deprecated(
+    note = "Usa HeuristicGatekeeper para reflejar con precisión la naturaleza del escaneo heurístico."
+)]
+pub type SlmGatekeeper = HeuristicGatekeeper;
+
+impl HeuristicGatekeeper {
     pub fn new() -> Self {
         Self
     }
 
-    /// Analiza el payload en busca de patrones sensibles o vectores de ataque.
+    /// Analiza el payload en busca de patrones sensibles, inyecciones de prompt o codificación inválida.
     pub fn inspect(&self, payload: &[u8]) -> Result<(), GatekeeperThreat> {
-        let text = match std::str::from_utf8(payload) {
-            Ok(s) => s,
-            Err(_) => return Ok(()), // Payloads puramente binarios cifrados pasan al control criptográfico
-        };
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        // Rechazo explícito de secuencias UTF-8 inválidas
+        let text = std::str::from_utf8(payload).map_err(|e| {
+            GatekeeperThreat::InvalidUtf8Encoding(format!(
+                "Secuencia UTF-8 malformada en payload semántico: {}",
+                e
+            ))
+        })?;
 
         // 1. Detección de tokens y claves de API
         if text.contains("sk-")
@@ -101,19 +118,17 @@ impl SlmGatekeeper {
                 digits.clear();
             }
         }
-
         if digits.len() >= 13 && digits.len() <= 19 && Self::luhn_check(&digits) {
-            return Some(digits);
+            Some(digits)
+        } else {
+            None
         }
-
-        None
     }
 
-    /// Algoritmo de Luhn para verificación de tarjetas de crédito.
+    /// Implementación de verificación con algoritmo de Luhn (Módulo 10).
     fn luhn_check(digits: &str) -> bool {
         let mut sum = 0;
         let mut alternate = false;
-
         for ch in digits.chars().rev() {
             if let Some(mut d) = ch.to_digit(10) {
                 if alternate {
@@ -128,7 +143,6 @@ impl SlmGatekeeper {
                 return false;
             }
         }
-
         sum % 10 == 0
     }
 }

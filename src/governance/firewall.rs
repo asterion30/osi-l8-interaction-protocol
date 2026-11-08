@@ -1,6 +1,6 @@
 //! RFC-ILP-2026: Cognitive Reference Monitor (CRM) & Mandatory Semantic Access Control (MSAC) Firewall
 
-use crate::governance::gatekeeper::{GatekeeperThreat, SlmGatekeeper};
+use crate::governance::gatekeeper::{GatekeeperThreat, HeuristicGatekeeper};
 use crate::governance::policy::UserGovernancePolicy;
 use crate::governance::taint::{ProcessTaintContext, TaintTag};
 use crate::ipdu::flags::CognitivePolicyFlags;
@@ -106,7 +106,7 @@ pub const DEFAULT_MAX_AUDIT_LOG_CAPACITY: usize = 10_000;
 #[derive(Debug, Clone)]
 pub struct CognitiveFirewall {
     pub policy: UserGovernancePolicy,
-    pub gatekeeper: SlmGatekeeper,
+    pub gatekeeper: HeuristicGatekeeper,
     pub audit_log: VecDeque<AuditRecord>,
     pub max_audit_entries: usize,
 }
@@ -122,7 +122,7 @@ impl CognitiveFirewall {
     pub fn with_audit_capacity(policy: UserGovernancePolicy, max_audit_entries: usize) -> Self {
         Self {
             policy,
-            gatekeeper: SlmGatekeeper::new(),
+            gatekeeper: HeuristicGatekeeper::new(),
             audit_log: VecDeque::new(),
             max_audit_entries,
         }
@@ -154,7 +154,7 @@ impl CognitiveFirewall {
         // =========================================================================
         // PASO 1: Auditoría de Tinte de Proceso vs Políticas de Privacidad (Sub-microsegundo)
         // =========================================================================
-        if process.is_external_egress && self.policy.deny_external_egress_if_tainted {
+        if process.is_external_egress() && self.policy.deny_external_egress_if_tainted {
             let critical_taint = TaintTag::MEDICAL_PII
                 | TaintTag::FINANCIAL_DATA
                 | TaintTag::CREDENTIALS
@@ -164,14 +164,14 @@ impl CognitiveFirewall {
                 let sources = process.format_taint_sources();
                 let reason = format!(
                     "Bloqueo MSAC: Proceso PID {} ({}) tiene tinte [{}] (orígenes: {}) y prohíbe salida a red externa",
-                    process.pid, process.agent_name, process.taint, sources
+                    process.pid(), process.agent_name(), process.current_taint(), sources
                 );
 
                 let record = AuditRecord {
                     timestamp_ms: now_ms,
                     session_uuid,
-                    pid: process.pid,
-                    agent_name: process.agent_name.clone(),
+                    pid: process.pid(),
+                    agent_name: process.agent_name().to_string(),
                     performative: perf_str,
                     verdict: Verdict::Drop,
                     error_code: Some(CognitiveErrorCode::EpermCognitivePolicy),
@@ -301,6 +301,9 @@ impl CognitiveFirewall {
                 GatekeeperThreat::PromptInjectionAttempt(msg) => {
                     (CognitiveErrorCode::EpermPromptInjection, msg)
                 }
+                GatekeeperThreat::InvalidUtf8Encoding(msg) => {
+                    (CognitiveErrorCode::EpermSemanticExfiltration, msg)
+                }
             };
 
             return self.record_drop(
@@ -309,7 +312,7 @@ impl CognitiveFirewall {
                 process,
                 perf_str,
                 err_code,
-                format!("Guardián SLM bloqueó el paquete: {}", reason),
+                format!("Guardián heurístico bloqueó el paquete: {}", reason),
                 3,
             );
         }
@@ -320,8 +323,8 @@ impl CognitiveFirewall {
         let record = AuditRecord {
             timestamp_ms: now_ms,
             session_uuid,
-            pid: process.pid,
-            agent_name: process.agent_name.clone(),
+            pid: process.pid(),
+            agent_name: process.agent_name().to_string(),
             performative: perf_str,
             verdict: Verdict::Allow,
             error_code: None,
@@ -353,8 +356,8 @@ impl CognitiveFirewall {
         let record = AuditRecord {
             timestamp_ms: now_ms,
             session_uuid,
-            pid: process.pid,
-            agent_name: process.agent_name.clone(),
+            pid: process.pid(),
+            agent_name: process.agent_name().to_string(),
             performative: perf_str,
             verdict: Verdict::Drop,
             error_code: Some(error_code),

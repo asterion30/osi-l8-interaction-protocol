@@ -337,9 +337,23 @@ fn test_taint_source_descriptor_traceability_in_audit_record() {
         "El log forense debe incluir el descriptor de origen: {}",
         audit.reason
     );
-    assert_eq!(proc.taint_history.len(), 1);
+    assert_eq!(proc.history().len(), 1);
     assert_eq!(
-        proc.taint_history[0].source_descriptor,
+        proc.history()[0].source_descriptor,
         "read:/var/lib/hospital/oncology_records.db"
     );
+}
+
+#[test]
+fn test_policy_from_conf_str_duplicate_keys_and_sandbox_tier_limits() {
+    let duplicate_key_conf = r#"
+user_did = did:key:first
+user_did = did:key:duplicate
+"#;
+    let err = UserGovernancePolicy::from_conf_str(duplicate_key_conf).unwrap_err();
+    assert!(err.message.contains("Clave duplicada"));
+
+    let bad_sandbox_conf = "require_sandbox_above_tier = 64";
+    let err2 = UserGovernancePolicy::from_conf_str(bad_sandbox_conf).unwrap_err();
+    assert!(err2.message.contains("excede el límite"));
 }

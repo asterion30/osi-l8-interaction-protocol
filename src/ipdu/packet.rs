@@ -54,13 +54,27 @@ pub fn validate_frame_bounds(raw: &[u8]) -> Result<usize, IpduError> {
         });
     }
 
+    // 5. Exigir exactitud de trama: prohibir bytes sobrantes (TrailingBytes)
+    if raw.len() > total_expected {
+        return Err(IpduError::TrailingBytes(raw.len() - total_expected));
+    }
+
     Ok(payload_len)
 }
 
 impl IpduPacket {
-    /// Construye un nuevo paquete I-PDU.
+    /// Intenta construir un nuevo paquete I-PDU validando cotas duras en el payload.
+    pub fn try_new(header: IpduHeader, payload: Vec<u8>) -> Result<Self, IpduError> {
+        if payload.len() > MAX_ILP_PAYLOAD_SIZE {
+            return Err(IpduError::PayloadTooLarge(payload.len()));
+        }
+        Ok(Self { header, payload })
+    }
+
+    /// Construye un nuevo paquete I-PDU asegurando que jamás exceda 64 KiB en memoria.
     pub fn new(header: IpduHeader, payload: Vec<u8>) -> Self {
-        Self { header, payload }
+        Self::try_new(header, payload)
+            .expect("El payload excede la cota máxima permitida (MAX_ILP_PAYLOAD_SIZE = 64 KiB)")
     }
 
     /// Longitud total del paquete serializado en bytes.
@@ -80,7 +94,15 @@ impl IpduPacket {
         bytes
     }
 
-    /// Deserializa un paquete completo desde un búfer de red aplicando blindaje de cotas.
+    /// Serializa de manera simétrica validando cotas estrictas.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, IpduError> {
+        if self.payload.len() > MAX_ILP_PAYLOAD_SIZE {
+            return Err(IpduError::PayloadTooLarge(self.payload.len()));
+        }
+        Ok(self.to_bytes())
+    }
+
+    /// Deserializa un paquete completo desde un búfer de red aplicando blindaje de cotas y exactitud de trama.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, IpduError> {
         let payload_len = validate_frame_bounds(buf)?;
         let header = IpduHeader::from_canonical_bytes(&buf[0..CANONICAL_HEADER_SIZE])?;
@@ -88,7 +110,7 @@ impl IpduPacket {
         let payload_start = CANONICAL_HEADER_SIZE + 4;
         let payload = buf[payload_start..payload_start + payload_len].to_vec();
 
-        Ok(Self { header, payload })
+        Self::try_new(header, payload)
     }
 
     /// Intenta interpretar el payload como texto UTF-8 (ej. JSON-LD o intención natural).

@@ -11,7 +11,7 @@
 
 pub mod session;
 
-pub use session::{IlpSession, SessionState, SetSocketTimeout, TerminationReason};
+pub use session::{IlpSession, SessionRole, SessionState, SetSocketTimeout, TerminationReason};
 
 use crate::ipdu::header::{IpduError, IpduHeader, CANONICAL_HEADER_SIZE};
 use crate::ipdu::packet::{IpduPacket, MAX_ILP_PAYLOAD_SIZE};

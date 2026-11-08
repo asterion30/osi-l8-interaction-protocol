@@ -115,30 +115,31 @@ impl fmt::Display for TaintTag {
     }
 }
 
+/// Capacidad máxima acotada para el historial de eventos de tinte en memoria.
+pub const MAX_TAINT_HISTORY: usize = 64;
+
 /// Evento auditable de contaminación de tinte con trazabilidad de origen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintEvent {
     /// Etiqueta asignada al proceso.
     pub tag: TaintTag,
-    /// Descriptor de origen (ej. "read:/etc/medical_records.db" o "mcp:tool_output:patient_lookup").
+    /// Descriptor de origen sanitizado (hasta 128 caracteres ASCII imprimibles).
     pub source_descriptor: String,
     /// Marca temporal en nanosegundos desde UNIX_EPOCH.
     pub timestamp_ns: u64,
 }
 
 /// Contexto de ejecución del proceso o agente emisor en el Sistema Operativo.
+///
+/// Invariante de seguridad: El tinte es estrictamente monótono creciente y sus campos
+/// son privados para impedir que el código en espacio de usuario limpie o adultere la mancha.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessTaintContext {
-    /// Identificador del proceso (PID) o runtime del agente.
-    pub pid: u32,
-    /// Nombre mnemónico del agente.
-    pub agent_name: String,
-    /// Máscara acumulativa de tinte (propagación monotónica inmutable).
-    pub taint: TaintTag,
-    /// Destino de la conexión (true si es red pública / internet externo).
-    pub is_external_egress: bool,
-    /// Historial cronológico de eventos de mancha con descriptores de origen.
-    pub taint_history: Vec<TaintEvent>,
+    pid: u32,
+    agent_name: String,
+    taint: TaintTag,
+    is_external_egress: bool,
+    taint_history: Vec<TaintEvent>,
 }
 
 impl ProcessTaintContext {
@@ -149,22 +150,71 @@ impl ProcessTaintContext {
             agent_name: agent_name.into(),
             taint: TaintTag::CLEAN,
             is_external_egress,
-            taint_history: Vec::new(),
+            taint_history: Vec::with_capacity(MAX_TAINT_HISTORY.min(16)),
         }
     }
 
+    /// Retorna el PID del proceso o runtime del agente.
+    #[inline]
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Retorna el nombre mnemónico del agente.
+    #[inline]
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+
+    /// Retorna si el destino de la conexión es una interfaz externa / internet.
+    #[inline]
+    pub fn is_external_egress(&self) -> bool {
+        self.is_external_egress
+    }
+
+    /// Retorna la máscara de bits de tinte actual acumulada por el proceso.
+    #[inline]
+    pub fn current_taint(&self) -> TaintTag {
+        self.taint
+    }
+
+    /// Retorna si el proceso posee alguna de las etiquetas críticas dadas.
+    #[inline]
+    pub fn has_taint(&self, tag: TaintTag) -> bool {
+        self.taint.intersects(tag)
+    }
+
+    /// Retorna una referencia inmutable a la secuencia de eventos de tinte registrados.
+    #[inline]
+    pub fn history(&self) -> &[TaintEvent] {
+        &self.taint_history
+    }
+
     /// Aplica una nueva etiqueta de tinte registrando formalmente el origen del evento.
-    /// El tinte es monotónicamente creciente: una vez contaminado, no puede limpiarse.
-    pub fn apply_taint(&mut self, new_tag: TaintTag, source_descriptor: impl Into<String>) {
+    ///
+    /// Invariante: El tinte solo puede expandirse, jamás reducirse o eliminarse.
+    /// El descriptor de origen es truncado y sanitizado a 128 caracteres ASCII imprimibles.
+    pub fn apply_taint(&mut self, new_tag: TaintTag, source: &str) {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
 
+        let sanitized: String = source
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .take(128)
+            .collect();
+
         self.taint = self.taint | new_tag;
+
+        if self.taint_history.len() >= MAX_TAINT_HISTORY {
+            self.taint_history.remove(0);
+        }
+
         self.taint_history.push(TaintEvent {
             tag: new_tag,
-            source_descriptor: source_descriptor.into(),
+            source_descriptor: sanitized,
             timestamp_ns: now_ns,
         });
     }
@@ -173,12 +223,6 @@ impl ProcessTaintContext {
     /// El tinte solo puede expandirse, nunca eliminarse por el propio proceso.
     pub fn contaminate_with(&mut self, new_tag: TaintTag) {
         self.apply_taint(new_tag, "unspecified_source");
-    }
-
-    /// Retorna si el proceso posee alguna de las etiquetas críticas dadas.
-    #[inline]
-    pub fn has_taint(&self, tag: TaintTag) -> bool {
-        self.taint.intersects(tag)
     }
 
     /// Retorna un resumen formateado de los orígenes de la mancha.

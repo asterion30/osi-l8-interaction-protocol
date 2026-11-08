@@ -5,7 +5,7 @@
 
 pub mod mcp_adapter;
 
-pub use mcp_adapter::{fnv1a_64, McpBridge};
+pub use mcp_adapter::{fnv1a_64, McpBridge, McpBridgeError};
 
 #[cfg(feature = "mcp")]
 pub use mcp_adapter::{McpRpcRequest, McpRpcResponse};

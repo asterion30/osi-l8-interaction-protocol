@@ -89,7 +89,10 @@ impl UserGovernancePolicy {
     /// Parsea un u64 aceptando notación decimal ("12345") o hexadecimal ("0xDEADBEEF").
     fn parse_u64_token(val: &str) -> Result<u64, String> {
         let trimmed = val.trim();
-        if let Some(hex_str) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        if let Some(hex_str) = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
             u64::from_str_radix(hex_str, 16)
                 .map_err(|e| format!("Valor hexadecimal inválido '{}': {}", val, e))
         } else {
@@ -111,6 +114,7 @@ impl UserGovernancePolicy {
     /// Carga una política desde un string en formato de configuración `.conf` estricto UNIX.
     pub fn from_conf_str(conf: &str) -> Result<Self, PolicyParseError> {
         let mut policy = Self::default();
+        let mut seen_keys = HashSet::new();
 
         for (idx, raw_line) in conf.lines().enumerate() {
             let line_number = idx + 1;
@@ -124,11 +128,28 @@ impl UserGovernancePolicy {
             // Partir en clave = valor
             let (key, value) = line.split_once('=').ok_or_else(|| PolicyParseError {
                 line_number,
-                message: format!("Sintaxis inválida (se esperaba 'clave = valor'): '{}'", line),
+                message: format!(
+                    "Sintaxis inválida (se esperaba 'clave = valor'): '{}'",
+                    line
+                ),
             })?;
 
             let key = key.trim();
             let value = value.trim();
+
+            if key.is_empty() {
+                return Err(PolicyParseError {
+                    line_number,
+                    message: "Clave vacía en directiva de configuración".to_string(),
+                });
+            }
+
+            if key != "blacklist_skill" && key != "whitelist_skill" && !seen_keys.insert(key) {
+                return Err(PolicyParseError {
+                    line_number,
+                    message: format!("Clave duplicada no permitida: '{}'", key),
+                });
+            }
 
             match key {
                 "user_did" => {
@@ -149,7 +170,10 @@ impl UserGovernancePolicy {
                     if parsed > 63 {
                         return Err(PolicyParseError {
                             line_number,
-                            message: format!("max_autonomy_tier excede el límite de 63: {}", parsed),
+                            message: format!(
+                                "max_autonomy_tier excede el límite de 63: {}",
+                                parsed
+                            ),
                         });
                     }
                     policy.max_autonomy_tier = parsed;
@@ -166,6 +190,15 @@ impl UserGovernancePolicy {
                         line_number,
                         message: format!("require_sandbox_above_tier inválido: {}", e),
                     })?;
+                    if parsed > 63 {
+                        return Err(PolicyParseError {
+                            line_number,
+                            message: format!(
+                                "require_sandbox_above_tier excede el límite de 63: {}",
+                                parsed
+                            ),
+                        });
+                    }
                     policy.require_sandbox_above_tier = parsed;
                 }
                 "deny_external_egress_if_tainted" => {

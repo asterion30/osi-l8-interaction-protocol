@@ -170,3 +170,24 @@ fn test_validate_frame_bounds_truncated_payload() {
         })
     ));
 }
+
+#[test]
+fn test_validate_frame_bounds_trailing_bytes() {
+    use ilp_core::ipdu::validate_frame_bounds;
+
+    let packet = IpduPacket::discover_skill(0x1234, 0x5678, CognitivePolicyFlags::EMPTY, "query");
+    let mut wire = packet.to_bytes();
+    // Añadir 7 bytes sobrantes al final de la trama
+    wire.extend_from_slice(b"TRAILER");
+
+    let res = validate_frame_bounds(&wire);
+    match res {
+        Err(IpduError::TrailingBytes(extra)) => assert_eq!(extra, 7),
+        other => panic!("Esperado TrailingBytes(7), recibido: {:?}", other),
+    }
+
+    assert!(matches!(
+        IpduPacket::from_bytes(&wire),
+        Err(IpduError::TrailingBytes(7))
+    ));
+}

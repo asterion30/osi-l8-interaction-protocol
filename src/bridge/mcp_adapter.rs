@@ -4,6 +4,9 @@
 //! Capa 8 (`ilp-core`) y el estándar de la industria **Model Context Protocol (MCP)** de Anthropic,
 //! encapsulando tramas JSON-RPC dentro de paquetes binarios `IpduPacket` protegidos por el MSAC.
 
+use crate::ipdu::header::IpduError;
+use core::fmt;
+
 #[cfg(feature = "mcp")]
 use crate::governance::firewall::{CognitiveFirewall, FilterDecision};
 #[cfg(feature = "mcp")]
@@ -11,7 +14,7 @@ use crate::governance::taint::ProcessTaintContext;
 #[cfg(feature = "mcp")]
 use crate::ipdu::flags::CognitivePolicyFlags;
 #[cfg(feature = "mcp")]
-use crate::ipdu::header::{IpduError, IpduHeader};
+use crate::ipdu::header::IpduHeader;
 #[cfg(feature = "mcp")]
 use crate::ipdu::packet::IpduPacket;
 #[cfg(feature = "mcp")]
@@ -34,6 +37,42 @@ pub fn fnv1a_64(data: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME_64);
     }
     hash
+}
+
+/// Errores específicos del adaptador puente MCP (JSON-RPC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpBridgeError {
+    /// Método JSON-RPC no soportado por el puente MCP.
+    UnsupportedMethod(String),
+    /// Error en la estructura o serialización JSON-RPC.
+    InvalidJsonRpc(String),
+    /// Error a nivel del protocolo binario I-PDU.
+    Protocol(IpduError),
+}
+
+impl From<IpduError> for McpBridgeError {
+    fn from(err: IpduError) -> Self {
+        Self::Protocol(err)
+    }
+}
+
+impl fmt::Display for McpBridgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedMethod(m) => write!(f, "Método MCP no soportado: {}", m),
+            Self::InvalidJsonRpc(msg) => write!(f, "JSON-RPC inválido: {}", msg),
+            Self::Protocol(e) => write!(f, "Error de protocolo I-PDU: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for McpBridgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(feature = "mcp")]
@@ -103,26 +142,37 @@ impl McpBridge {
     }
 
     #[cfg(feature = "mcp")]
+    /// Deriva determinísticamente el `session_uuid` a partir del identificador `id` de JSON-RPC.
+    pub fn derive_session_uuid(id: &serde_json::Value) -> u64 {
+        match id {
+            serde_json::Value::String(s) => fnv1a_64(s.as_bytes()),
+            serde_json::Value::Number(n) => fnv1a_64(n.to_string().as_bytes()),
+            _ => fnv1a_64(id.to_string().as_bytes()),
+        }
+    }
+
+    #[cfg(feature = "mcp")]
     /// Encapsula una petición MCP JSON-RPC dentro de un paquete canónico `IpduPacket`.
     ///
     /// Mapeo de campos:
     /// - `tools/call` -> `Performative::ProposeIntent`
     /// - `tools/list` / `prompts/list` / `resources/list` -> `Performative::DiscoverSkill`
-    /// - otros -> `Performative::ProposeIntent`
-    /// - `skill_namespace_hash` -> FNV-1a del nombre de la herramienta
+    /// - cualquier otro método -> `Err(McpBridgeError::UnsupportedMethod(req.method.clone()))`
+    /// - `session_uuid` derivado determinísticamente de `req.id` mediante FNV-1a.
     pub fn encapsulate_request(
         req: &McpRpcRequest,
-        session_uuid: u64,
         budget_cap: u32,
         deadline_ttl_ms: u32,
-    ) -> Result<IpduPacket, IpduError> {
+    ) -> Result<IpduPacket, McpBridgeError> {
+        let performative = match req.method.as_str() {
+            "tools/call" => Performative::ProposeIntent,
+            "tools/list" | "prompts/list" | "resources/list" => Performative::DiscoverSkill,
+            _ => return Err(McpBridgeError::UnsupportedMethod(req.method.clone())),
+        };
+
+        let session_uuid = Self::derive_session_uuid(&req.id);
         let tool_name = req.tool_name();
         let skill_hash = Self::derive_skill_hash(&req.method, tool_name);
-
-        let performative = match req.method.as_str() {
-            "tools/list" | "prompts/list" | "resources/list" => Performative::DiscoverSkill,
-            _ => Performative::ProposeIntent,
-        };
 
         let header = IpduHeader::new(
             performative,
@@ -135,30 +185,47 @@ impl McpBridge {
             0,
         )?;
 
-        let payload_bytes = serde_json::to_vec(req)
-            .map_err(|e| IpduError::Io(format!("Error de serialización JSON-RPC: {}", e)))?;
+        let payload_bytes = serde_json::to_vec(req).map_err(|e| {
+            McpBridgeError::InvalidJsonRpc(format!("Error de serialización JSON-RPC: {}", e))
+        })?;
 
-        Ok(IpduPacket::new(header, payload_bytes))
+        Ok(IpduPacket::try_new(header, payload_bytes)?)
     }
 
     #[cfg(feature = "mcp")]
     /// Desencapsula una petición MCP JSON-RPC desde un paquete `IpduPacket`.
-    pub fn decapsulate_request(packet: &IpduPacket) -> Result<McpRpcRequest, IpduError> {
-        let req: McpRpcRequest = serde_json::from_slice(&packet.payload)
-            .map_err(|e| IpduError::Io(format!("Error al deserializar JSON-RPC: {}", e)))?;
+    pub fn decapsulate_request(packet: &IpduPacket) -> Result<McpRpcRequest, McpBridgeError> {
+        let req: McpRpcRequest = serde_json::from_slice(&packet.payload).map_err(|e| {
+            McpBridgeError::InvalidJsonRpc(format!("Error al deserializar JSON-RPC: {}", e))
+        })?;
         Ok(req)
     }
 
     #[cfg(feature = "mcp")]
-    /// Encapsula una respuesta MCP JSON-RPC dentro de un paquete de confirmación `IpduPacket`.
+    /// Encapsula una respuesta MCP JSON-RPC dentro de un paquete `IpduPacket`.
+    ///
+    /// Mapeo de campos:
+    /// - `result != null` -> `Performative::AttestResult`
+    /// - `error != null` -> `Performative::RejectPolicy`
+    /// - ningún campo -> `Err(McpBridgeError::InvalidJsonRpc)`
     pub fn encapsulate_response(
         resp: &McpRpcResponse,
-        session_uuid: u64,
         skill_hash: u64,
         budget_spent: u32,
-    ) -> Result<IpduPacket, IpduError> {
+    ) -> Result<IpduPacket, McpBridgeError> {
+        let performative = if resp.error.is_some() {
+            Performative::RejectPolicy
+        } else if resp.result.is_some() {
+            Performative::AttestResult
+        } else {
+            return Err(McpBridgeError::InvalidJsonRpc(
+                "La respuesta JSON-RPC debe contener 'result' o 'error'".to_string(),
+            ));
+        };
+
+        let session_uuid = Self::derive_session_uuid(&resp.id);
         let header = IpduHeader::new(
-            Performative::CommitContract,
+            performative,
             1,
             CognitivePolicyFlags::EMPTY,
             skill_hash,
@@ -168,17 +235,21 @@ impl McpBridge {
             0,
         )?;
 
-        let payload_bytes = serde_json::to_vec(resp)
-            .map_err(|e| IpduError::Io(format!("Error de serialización JSON-RPC: {}", e)))?;
+        let payload_bytes = serde_json::to_vec(resp).map_err(|e| {
+            McpBridgeError::InvalidJsonRpc(format!("Error de serialización JSON-RPC: {}", e))
+        })?;
 
-        Ok(IpduPacket::new(header, payload_bytes))
+        Ok(IpduPacket::try_new(header, payload_bytes)?)
     }
 
     #[cfg(feature = "mcp")]
     /// Desencapsula una respuesta MCP JSON-RPC desde un paquete `IpduPacket`.
-    pub fn decapsulate_response(packet: &IpduPacket) -> Result<McpRpcResponse, IpduError> {
+    pub fn decapsulate_response(packet: &IpduPacket) -> Result<McpRpcResponse, McpBridgeError> {
         let resp: McpRpcResponse = serde_json::from_slice(&packet.payload).map_err(|e| {
-            IpduError::Io(format!("Error al deserializar respuesta JSON-RPC: {}", e))
+            McpBridgeError::InvalidJsonRpc(format!(
+                "Error al deserializar respuesta JSON-RPC: {}",
+                e
+            ))
         })?;
         Ok(resp)
     }
@@ -190,11 +261,10 @@ impl McpBridge {
         firewall: &mut CognitiveFirewall,
         taint_context: &ProcessTaintContext,
         req: &McpRpcRequest,
-        session_uuid: u64,
         budget_cap: u32,
         deadline_ttl_ms: u32,
-    ) -> Result<(IpduPacket, FilterDecision), IpduError> {
-        let packet = Self::encapsulate_request(req, session_uuid, budget_cap, deadline_ttl_ms)?;
+    ) -> Result<(IpduPacket, FilterDecision), McpBridgeError> {
+        let packet = Self::encapsulate_request(req, budget_cap, deadline_ttl_ms)?;
         let decision = firewall.inspect_egress(taint_context, &packet);
         Ok((packet, decision))
     }

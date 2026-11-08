@@ -2,7 +2,7 @@
 
 This document contains raw and processed micro-benchmark results for `ilp-core`,
 characterizing median (p50), 95th percentile (p95), 99th percentile (p99), and standard deviation
-across 100,000 independent samples in release mode (`--release`).
+across 100,000 independent operations measured in amortized batches in release mode (`--release`).
 
 ## Reproduction Command
 
@@ -13,7 +13,8 @@ cargo run --release --example benchmark_latency
 ## Execution Results
 
 ```text
-    Finished `release` profile [optimized] target(s) in 0.06s
+   Compiling ilp-core v0.1.0 (/home/rober/Documentos/Capa8)
+    Finished `release` profile [optimized] target(s) in 1.40s
      Running `target/release/examples/benchmark_latency`
 ================================================================================
   RFC-ILP-2026: LATENCY & STATISTICAL BENCHMARK
@@ -24,32 +25,33 @@ cargo run --release --example benchmark_latency
     • Platform:     linux (x86_64)
     • Build Config: RELEASE (Optimized with LLVM)
     • Warmup Iter:  10000
-    • Measured:     100000 samples per test
+    • Amortization: 100 ops per batch (1000 samples = 100000 total ops)
 ================================================================================
 
->>> DETAILED LATENCY DISTRIBUTION (Nanoseconds):
+>>> OVERHEAD ABSOLUTO DEL MONITOR EN ESPACIO DE USUARIO (ns/op):
 
 Operation / Target                     |     Min |     p50 |     p95 |     p99 |     Max |    Mean |  StdDev
 ---------------------------------------------------------------------------------------------------------
-1. I-PDU Header (36B Roundtrip)        |      66 |      69 |      70 |      73 |   21203 |    70.2 |    81.7
-2. I-PDU Packet (512B Wire Roundtrip)  |     152 |     158 |     240 |     306 |   32424 |   181.6 |   289.2
-3. MSAC Firewall (3-Step Inspection)   |     931 |     979 |    1228 |    1550 |   25109 |  1022.6 |   426.2
-4. Baseline JSON-RPC (512B Scan)       |     368 |     387 |     424 |     498 |   22095 |   397.7 |   251.9
+1. I-PDU Header (36B Roundtrip)        |    26.9 |    26.9 |    26.9 |    26.9 |   284.1 |    27.2 |     8.1
+2. I-PDU Packet (512B Wire Roundtrip)  |   112.6 |   112.6 |   127.0 |   178.3 |   579.2 |   116.2 |    25.9
+3. MSAC Firewall (3-Step Inspection)   |   886.5 |   908.6 |  1230.6 |  1455.8 |  1691.0 |   964.2 |   120.2
+4. Baseline JSON-RPC (512B Scan)       |   321.9 |   345.3 |   372.1 |   557.6 |   903.0 |   349.3 |    41.3
 
 --------------------------------------------------------------------------------
->>> MARKDOWN TABLE FOR README.md & AUDITORS
+>>> RESUMEN ESTADÍSTICO PARA AUDITORÍA Y DOCUMENTACIÓN
 --------------------------------------------------------------------------------
 
 | Operation / Subsystem | Framing / Size | Median (p50) | p95 Latency | p99 Latency | Max Latency | StdDev (σ) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **I-PDU Header Parsing** | 36 Bytes (Canonical) | **69 ns** | 70 ns | 73 ns | 21203 ns | ±81.7 ns |
-| **I-PDU Packet Wire Roundtrip** | 512B Payload | **158 ns** | 240 ns | 306 ns | 32424 ns | ±289.2 ns |
-| **MSAC Semantic Firewall Egress** | Full 3 Steps | **979 ns** | 1228 ns | 1550 ns | 25109 ns | ±426.2 ns |
-| **JSON-RPC String Scan (Baseline)** | 512B Text | **387 ns** | 424 ns | 498 ns | 22095 ns | ±251.9 ns |
+| **I-PDU Header Parsing** | 36 Bytes (Canonical) | **26.9 ns** | 26.9 ns | 26.9 ns | 284.1 ns | ±8.1 ns |
+| **I-PDU Packet Wire Roundtrip** | 512B Payload | **112.6 ns** | 127.0 ns | 178.3 ns | 579.2 ns | ±25.9 ns |
+| **MSAC Semantic Firewall Egress** | Full 3 Steps | **908.6 ns** | 1230.6 ns | 1455.8 ns | 1691.0 ns | ±120.2 ns |
+| **JSON-RPC String Scan (Baseline)** | 512B Text | **345.3 ns** | 372.1 ns | 557.6 ns | 903.0 ns | ±41.3 ns |
 
-💡 Speedup factor: I-PDU header parsing achieves ~5.6x lower p50 latency than naive JSON-RPC field scanning.
+📌 Nota metodológica: Mediciones amortizadas en lotes de 100 operaciones para eliminar el artefacto del reloj (vDSO clock_gettime).
+   Los valores reflejan el overhead neto por operación en espacio de usuario.
 ✅ Benchmark finished successfully.
 ```
 
 ---
-*Generated automatically by `scripts/run_benchmarks.sh` on $(date -u).*
+*Generated automatically by `scripts/run_benchmarks.sh` on 2026-11-08T17:03:30Z.*

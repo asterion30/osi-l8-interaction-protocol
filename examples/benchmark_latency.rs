@@ -1,7 +1,8 @@
 //! RFC-ILP-2026: Latency Benchmark & Statistical Performance Characterization
 //!
-//! Este binario ejecuta un benchmark científico y reproducible midiendo individualmente
-//! 100,000 iteraciones tras un calentamiento (warmup) de 10,000 iteraciones.
+//! Este binario ejecuta un benchmark científico y reproducible midiendo en lotes amortizados
+//! de 100 operaciones para eliminar la distorsión del reloj del sistema (vDSO clock_gettime ~15-25 ns).
+//! Total: 100,000 operaciones por prueba tras 10,000 iteraciones de calentamiento.
 //!
 //! Reporta: Mínimo, Mediana (p50), p95, p99, Máximo, Promedio y Desviación Estándar.
 
@@ -13,7 +14,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 const WARMUP_ITERATIONS: usize = 10_000;
-const BENCHMARK_ITERATIONS: usize = 100_000;
+const BATCH_SIZE: usize = 100;
+const BENCHMARK_SAMPLES: usize = 1_000; // 1,000 lotes x 100 ops/lote = 100,000 ops totales
 
 #[derive(Debug, Clone)]
 struct SampleStats {
@@ -26,16 +28,16 @@ struct SampleStats {
     std_dev_ns: f64,
 }
 
-fn compute_stats(mut samples: Vec<u64>) -> SampleStats {
-    samples.sort_unstable();
+fn compute_stats(mut samples: Vec<f64>) -> SampleStats {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = samples.len() as f64;
-    let sum: u64 = samples.iter().sum();
-    let mean = sum as f64 / n;
+    let sum: f64 = samples.iter().sum();
+    let mean = sum / n;
 
     let variance = samples
         .iter()
         .map(|&x| {
-            let diff = x as f64 - mean;
+            let diff = x - mean;
             diff * diff
         })
         .sum::<f64>()
@@ -47,11 +49,11 @@ fn compute_stats(mut samples: Vec<u64>) -> SampleStats {
     let p99_idx = ((samples.len() as f64) * 0.99) as usize;
 
     SampleStats {
-        min_ns: samples[0] as f64,
-        p50_ns: samples[p50_idx.min(samples.len() - 1)] as f64,
-        p95_ns: samples[p95_idx.min(samples.len() - 1)] as f64,
-        p99_ns: samples[p99_idx.min(samples.len() - 1)] as f64,
-        max_ns: samples[samples.len() - 1] as f64,
+        min_ns: samples[0],
+        p50_ns: samples[p50_idx.min(samples.len() - 1)],
+        p95_ns: samples[p95_idx.min(samples.len() - 1)],
+        p99_ns: samples[p99_idx.min(samples.len() - 1)],
+        max_ns: samples[samples.len() - 1],
         mean_ns: mean,
         std_dev_ns: std_dev,
     }
@@ -103,7 +105,12 @@ fn main() {
     println!("    • Platform:     {} ({})", os, arch);
     println!("    • Build Config: {}", profile);
     println!("    • Warmup Iter:  {}", WARMUP_ITERATIONS);
-    println!("    • Measured:     {} samples per test", BENCHMARK_ITERATIONS);
+    println!(
+        "    • Amortization: {} ops per batch ({} samples = {} total ops)",
+        BATCH_SIZE,
+        BENCHMARK_SAMPLES,
+        BATCH_SIZE * BENCHMARK_SAMPLES
+    );
     println!("================================================================================\n");
 
     // -------------------------------------------------------------------------
@@ -152,13 +159,16 @@ fn main() {
         black_box((b, h));
     }
 
-    let mut samples_header = Vec::with_capacity(BENCHMARK_ITERATIONS);
-    for _ in 0..BENCHMARK_ITERATIONS {
+    let mut samples_header = Vec::with_capacity(BENCHMARK_SAMPLES);
+    for _ in 0..BENCHMARK_SAMPLES {
         let t0 = Instant::now();
-        let b = header.to_canonical_bytes();
-        let h = IpduHeader::from_canonical_bytes(black_box(&header_bytes)).unwrap();
-        black_box((b, h));
-        samples_header.push(t0.elapsed().as_nanos() as u64);
+        for _ in 0..BATCH_SIZE {
+            let b = header.to_canonical_bytes();
+            let h = IpduHeader::from_canonical_bytes(black_box(&header_bytes)).unwrap();
+            black_box((b, h));
+        }
+        let elapsed_batch = t0.elapsed().as_nanos() as f64;
+        samples_header.push(elapsed_batch / (BATCH_SIZE as f64));
     }
     let stats_header = compute_stats(samples_header);
 
@@ -171,13 +181,16 @@ fn main() {
         black_box((b, p));
     }
 
-    let mut samples_packet = Vec::with_capacity(BENCHMARK_ITERATIONS);
-    for _ in 0..BENCHMARK_ITERATIONS {
+    let mut samples_packet = Vec::with_capacity(BENCHMARK_SAMPLES);
+    for _ in 0..BENCHMARK_SAMPLES {
         let t0 = Instant::now();
-        let b = packet_512.to_bytes();
-        let p = IpduPacket::from_bytes(black_box(&packet_512_bytes)).unwrap();
-        black_box((b, p));
-        samples_packet.push(t0.elapsed().as_nanos() as u64);
+        for _ in 0..BATCH_SIZE {
+            let b = packet_512.to_bytes();
+            let p = IpduPacket::from_bytes(black_box(&packet_512_bytes)).unwrap();
+            black_box((b, p));
+        }
+        let elapsed_batch = t0.elapsed().as_nanos() as f64;
+        samples_packet.push(elapsed_batch / (BATCH_SIZE as f64));
     }
     let stats_packet = compute_stats(samples_packet);
 
@@ -189,12 +202,15 @@ fn main() {
         black_box(d);
     }
 
-    let mut samples_firewall = Vec::with_capacity(BENCHMARK_ITERATIONS);
-    for _ in 0..BENCHMARK_ITERATIONS {
+    let mut samples_firewall = Vec::with_capacity(BENCHMARK_SAMPLES);
+    for _ in 0..BENCHMARK_SAMPLES {
         let t0 = Instant::now();
-        let d = firewall.inspect_egress(black_box(&taint_ctx), black_box(&sample_packet));
-        black_box(d);
-        samples_firewall.push(t0.elapsed().as_nanos() as u64);
+        for _ in 0..BATCH_SIZE {
+            let d = firewall.inspect_egress(black_box(&taint_ctx), black_box(&sample_packet));
+            black_box(d);
+        }
+        let elapsed_batch = t0.elapsed().as_nanos() as f64;
+        samples_firewall.push(elapsed_batch / (BATCH_SIZE as f64));
     }
     let stats_firewall = compute_stats(samples_firewall);
 
@@ -216,19 +232,22 @@ fn main() {
         black_box(res);
     }
 
-    let mut samples_json = Vec::with_capacity(BENCHMARK_ITERATIONS);
-    for _ in 0..BENCHMARK_ITERATIONS {
+    let mut samples_json = Vec::with_capacity(BENCHMARK_SAMPLES);
+    for _ in 0..BENCHMARK_SAMPLES {
         let t0 = Instant::now();
-        let res = parse_json_baseline(black_box(json_rpc_bytes));
-        black_box(res);
-        samples_json.push(t0.elapsed().as_nanos() as u64);
+        for _ in 0..BATCH_SIZE {
+            let res = parse_json_baseline(black_box(json_rpc_bytes));
+            black_box(res);
+        }
+        let elapsed_batch = t0.elapsed().as_nanos() as f64;
+        samples_json.push(elapsed_batch / (BATCH_SIZE as f64));
     }
     let stats_json = compute_stats(samples_json);
 
     // -------------------------------------------------------------------------
     // STATISTICAL REPORT OUTPUT
     // -------------------------------------------------------------------------
-    println!(">>> DETAILED LATENCY DISTRIBUTION (Nanoseconds):\n");
+    println!(">>> OVERHEAD ABSOLUTO DEL MONITOR EN ESPACIO DE USUARIO (ns/op):\n");
     println!(
         "{:<38} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7}",
         "Operation / Target", "Min", "p50", "p95", "p99", "Max", "Mean", "StdDev"
@@ -237,7 +256,7 @@ fn main() {
 
     let print_row = |name: &str, s: &SampleStats| {
         println!(
-            "{:<38} | {:>7.0} | {:>7.0} | {:>7.0} | {:>7.0} | {:>7.0} | {:>7.1} | {:>7.1}",
+            "{:<38} | {:>7.1} | {:>7.1} | {:>7.1} | {:>7.1} | {:>7.1} | {:>7.1} | {:>7.1}",
             name, s.min_ns, s.p50_ns, s.p95_ns, s.p99_ns, s.max_ns, s.mean_ns, s.std_dev_ns
         );
     };
@@ -248,34 +267,29 @@ fn main() {
     print_row("4. Baseline JSON-RPC (512B Scan)", &stats_json);
 
     println!("\n--------------------------------------------------------------------------------");
-    println!(">>> MARKDOWN TABLE FOR README.md & AUDITORS");
+    println!(">>> RESUMEN ESTADÍSTICO PARA AUDITORÍA Y DOCUMENTACIÓN");
     println!("--------------------------------------------------------------------------------\n");
 
     println!("| Operation / Subsystem | Framing / Size | Median (p50) | p95 Latency | p99 Latency | Max Latency | StdDev (σ) |");
     println!("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |");
     println!(
-        "| **I-PDU Header Parsing** | 36 Bytes (Canonical) | **{:.0} ns** | {:.0} ns | {:.0} ns | {:.0} ns | ±{:.1} ns |",
+        "| **I-PDU Header Parsing** | 36 Bytes (Canonical) | **{:.1} ns** | {:.1} ns | {:.1} ns | {:.1} ns | ±{:.1} ns |",
         stats_header.p50_ns, stats_header.p95_ns, stats_header.p99_ns, stats_header.max_ns, stats_header.std_dev_ns
     );
     println!(
-        "| **I-PDU Packet Wire Roundtrip** | 512B Payload | **{:.0} ns** | {:.0} ns | {:.0} ns | {:.0} ns | ±{:.1} ns |",
+        "| **I-PDU Packet Wire Roundtrip** | 512B Payload | **{:.1} ns** | {:.1} ns | {:.1} ns | {:.1} ns | ±{:.1} ns |",
         stats_packet.p50_ns, stats_packet.p95_ns, stats_packet.p99_ns, stats_packet.max_ns, stats_packet.std_dev_ns
     );
     println!(
-        "| **MSAC Semantic Firewall Egress** | Full 3 Steps | **{:.0} ns** | {:.0} ns | {:.0} ns | {:.0} ns | ±{:.1} ns |",
+        "| **MSAC Semantic Firewall Egress** | Full 3 Steps | **{:.1} ns** | {:.1} ns | {:.1} ns | {:.1} ns | ±{:.1} ns |",
         stats_firewall.p50_ns, stats_firewall.p95_ns, stats_firewall.p99_ns, stats_firewall.max_ns, stats_firewall.std_dev_ns
     );
     println!(
-        "| **JSON-RPC String Scan (Baseline)** | 512B Text | **{:.0} ns** | {:.0} ns | {:.0} ns | {:.0} ns | ±{:.1} ns |",
+        "| **JSON-RPC String Scan (Baseline)** | 512B Text | **{:.1} ns** | {:.1} ns | {:.1} ns | {:.1} ns | ±{:.1} ns |",
         stats_json.p50_ns, stats_json.p95_ns, stats_json.p99_ns, stats_json.max_ns, stats_json.std_dev_ns
     );
 
-    let speedup = if stats_header.p50_ns > 0.0 {
-        stats_json.p50_ns / stats_header.p50_ns
-    } else {
-        1.0
-    };
-
-    println!("\n💡 Speedup factor: I-PDU header parsing achieves ~{:.1}x lower p50 latency than naive JSON-RPC field scanning.", speedup);
+    println!("\n📌 Nota metodológica: Mediciones amortizadas en lotes de {} operaciones para eliminar el artefacto del reloj (vDSO clock_gettime).", BATCH_SIZE);
+    println!("   Los valores reflejan el overhead neto por operación en espacio de usuario.");
     println!("✅ Benchmark finished successfully.");
 }

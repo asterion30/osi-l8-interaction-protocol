@@ -9,6 +9,8 @@ pub use firewall::{
     AuditRecord, CognitiveErrorCode, CognitiveFirewall, FilterDecision, Verdict,
     DEFAULT_MAX_AUDIT_LOG_CAPACITY,
 };
-pub use gatekeeper::{GatekeeperThreat, SlmGatekeeper};
+#[allow(deprecated)]
+pub use gatekeeper::SlmGatekeeper;
+pub use gatekeeper::{GatekeeperThreat, HeuristicGatekeeper};
 pub use policy::{PolicyParseError, UserGovernancePolicy};
 pub use taint::{ProcessTaintContext, TaintEvent, TaintTag};

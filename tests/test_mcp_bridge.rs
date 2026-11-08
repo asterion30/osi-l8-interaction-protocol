@@ -1,6 +1,6 @@
 #![cfg(feature = "mcp")]
 
-use ilp_core::bridge::{fnv1a_64, McpBridge, McpRpcRequest, McpRpcResponse};
+use ilp_core::bridge::{fnv1a_64, McpBridge, McpBridgeError, McpRpcRequest, McpRpcResponse};
 use ilp_core::governance::{
     CognitiveErrorCode, CognitiveFirewall, ProcessTaintContext, TaintTag, UserGovernancePolicy,
     Verdict,
@@ -31,15 +31,15 @@ fn test_mcp_tool_call_encapsulation_and_decapsulation() {
         }),
     );
 
-    let session_uuid = 0x1234_5678_90AB_CDEF;
     let budget_cap = 250;
     let ttl_ms = 15_000;
 
-    let packet = McpBridge::encapsulate_request(&req, session_uuid, budget_cap, ttl_ms)
-        .expect("Encapsular llamada MCP");
+    let packet =
+        McpBridge::encapsulate_request(&req, budget_cap, ttl_ms).expect("Encapsular llamada MCP");
 
     assert_eq!(packet.header.performative, Performative::ProposeIntent);
-    assert_eq!(packet.header.session_uuid, session_uuid);
+    let expected_session_uuid = McpBridge::derive_session_uuid(&req.id);
+    assert_eq!(packet.header.session_uuid, expected_session_uuid);
     assert_eq!(packet.header.max_budget_cap, budget_cap);
     assert_eq!(packet.header.deadline_ttl_ms, ttl_ms);
 
@@ -64,19 +64,56 @@ fn test_mcp_response_encapsulation_and_decapsulation() {
         error: None,
     };
 
-    let session_uuid = 0x9999_8888_7777_6666;
     let skill_hash = 0xAAAA_BBBB_CCCC_DDDD;
     let budget_spent = 180;
 
-    let packet = McpBridge::encapsulate_response(&resp, session_uuid, skill_hash, budget_spent)
-        .expect("Encapsular respuesta MCP");
+    let packet = McpBridge::encapsulate_response(&resp, skill_hash, budget_spent)
+        .expect("Encapsular respuesta MCP exitosa");
 
-    assert_eq!(packet.header.performative, Performative::CommitContract);
+    assert_eq!(packet.header.performative, Performative::AttestResult);
     assert_eq!(packet.header.max_budget_cap, budget_spent);
+    assert_eq!(
+        packet.header.session_uuid,
+        McpBridge::derive_session_uuid(&resp.id)
+    );
 
     let decoded_resp = McpBridge::decapsulate_response(&packet).expect("Desencapsular respuesta");
 
     assert_eq!(decoded_resp, resp);
+}
+
+#[test]
+fn test_mcp_response_error_encapsulation() {
+    let resp = McpRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: json!("err-001"),
+        result: None,
+        error: Some(json!({
+            "code": -32600,
+            "message": "Invalid Request"
+        })),
+    };
+
+    let skill_hash = 0xAAAA_BBBB_CCCC_DDDD;
+    let packet = McpBridge::encapsulate_response(&resp, skill_hash, 0)
+        .expect("Encapsular respuesta de error MCP");
+
+    assert_eq!(packet.header.performative, Performative::RejectPolicy);
+}
+
+#[test]
+fn test_mcp_unsupported_method_rejection() {
+    let unknown_req = McpRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: json!(42),
+        method: "notifications/cancelled".to_string(),
+        params: json!({}),
+    };
+
+    let result = McpBridge::encapsulate_request(&unknown_req, 100, 1000);
+    assert!(
+        matches!(result, Err(McpBridgeError::UnsupportedMethod(m)) if m == "notifications/cancelled")
+    );
 }
 
 #[test]
@@ -98,7 +135,7 @@ fn test_mcp_inspect_and_wrap_prompt_injection_drop() {
     );
 
     let (_pkt, decision) =
-        McpBridge::inspect_and_wrap(&mut firewall, &taint, &malicious_req, 0x1111, 200, 5_000)
+        McpBridge::inspect_and_wrap(&mut firewall, &taint, &malicious_req, 200, 5_000)
             .expect("Wrap and inspect");
 
     assert_eq!(decision.verdict, Verdict::Drop);
@@ -117,7 +154,7 @@ fn test_mcp_inspect_and_wrap_taint_drop() {
     let mut firewall = CognitiveFirewall::new(policy);
 
     let mut taint = ProcessTaintContext::new(1042, "Mcp-Client", true);
-    taint.contaminate_with(TaintTag::MEDICAL_PII);
+    taint.apply_taint(TaintTag::MEDICAL_PII, "clinical_notes_test");
 
     let req = McpRpcRequest::new_tool_call(
         2,
@@ -125,9 +162,8 @@ fn test_mcp_inspect_and_wrap_taint_drop() {
         json!({"query": "oncology clinical trials"}),
     );
 
-    let (_pkt, decision) =
-        McpBridge::inspect_and_wrap(&mut firewall, &taint, &req, 0x2222, 150, 5_000)
-            .expect("Wrap and inspect");
+    let (_pkt, decision) = McpBridge::inspect_and_wrap(&mut firewall, &taint, &req, 150, 5_000)
+        .expect("Wrap and inspect");
 
     assert_eq!(decision.verdict, Verdict::Drop);
     assert_eq!(

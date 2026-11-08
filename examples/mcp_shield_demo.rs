@@ -36,8 +36,7 @@ fn main() {
     let mut firewall = CognitiveFirewall::new(policy);
 
     // Contexto de ejecución del agente cliente (ej. Claude Desktop o agente local)
-    let mut taint_context = ProcessTaintContext::new(2048, "Claude-Desktop-Agent", false);
-    let session_uuid = 0xABCD_EF01_2345_6789;
+    let taint_context = ProcessTaintContext::new(2048, "Claude-Desktop-Agent", false);
 
     // -------------------------------------------------------------------------
     // CASO 1: Llamada Legítima a Herramienta MCP (Protected & Wrapped)
@@ -66,7 +65,6 @@ fn main() {
         &mut firewall,
         &taint_context,
         &legitimate_call,
-        session_uuid,
         50, // 50 tokens de presupuesto máximo declarado
         5_000,
     )
@@ -99,7 +97,6 @@ fn main() {
     };
     let response_packet = McpBridge::encapsulate_response(
         &mcp_response,
-        session_uuid,
         packet.header.skill_namespace_hash,
         42, // Gasto real: 42 tokens
     )
@@ -134,15 +131,9 @@ fn main() {
     );
 
     let t1 = Instant::now();
-    let (_inj_packet, inj_decision) = McpBridge::inspect_and_wrap(
-        &mut firewall,
-        &taint_context,
-        &injection_call,
-        session_uuid,
-        100,
-        5_000,
-    )
-    .expect("Wrap and inspect");
+    let (_inj_packet, inj_decision) =
+        McpBridge::inspect_and_wrap(&mut firewall, &taint_context, &injection_call, 100, 5_000)
+            .expect("Wrap and inspect");
     let inj_time_ns = t1.elapsed().as_nanos();
 
     println!(
@@ -167,10 +158,10 @@ fn main() {
 
     println!(
         "[{:>8} µs] [Agent Context] El agente procesa historial clínico y adquiere TaintTag::MEDICAL_PII.",
-        demo_start.elapsed().as_micros()
+        demo_start.elapsed().as_micros(),
     );
-    taint_context.contaminate_with(TaintTag::MEDICAL_PII);
-    taint_context.is_external_egress = true; // Intenta salir a herramienta externa en nube
+    let mut tainted_context = ProcessTaintContext::new(1001, "Claude-Agent-Worker", true);
+    tainted_context.apply_taint(TaintTag::MEDICAL_PII, "read:/var/lib/patient_history.db");
 
     let pii_call = McpRpcRequest::new_tool_call(
         "rpc-call-003",
@@ -181,15 +172,9 @@ fn main() {
     );
 
     let t2 = Instant::now();
-    let (_pii_packet, pii_decision) = McpBridge::inspect_and_wrap(
-        &mut firewall,
-        &taint_context,
-        &pii_call,
-        session_uuid,
-        50,
-        5_000,
-    )
-    .expect("Wrap and inspect");
+    let (_pii_packet, pii_decision) =
+        McpBridge::inspect_and_wrap(&mut firewall, &tainted_context, &pii_call, 50, 5_000)
+            .expect("Wrap and inspect");
     let pii_time_ns = t2.elapsed().as_nanos();
 
     println!(

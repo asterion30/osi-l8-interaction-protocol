@@ -369,8 +369,10 @@ fn main() {
         start,
         "El Agente A procesa un informe de oncología y adquiere TaintTag::MEDICAL_PII.",
     );
-    proxy.taint_context.contaminate_with(TaintTag::MEDICAL_PII);
-    proxy.taint_context.is_external_egress = true;
+    proxy.taint_context = ProcessTaintContext::new(1001, "Agent-A-Requester", true);
+    proxy
+        .taint_context
+        .apply_taint(TaintTag::MEDICAL_PII, "read:/var/data/oncology_report.pdf");
 
     let exfil_pkt = IpduPacket::propose_intent(
         SKILL_CLINICAL_NLP,
@@ -393,9 +395,8 @@ fn main() {
     println!("\n--------------------------------------------------------------------------------");
     println!(">>> ESCENARIO 3: Bloqueo por Inyección Adversaria en Payload Semántico");
     println!("--------------------------------------------------------------------------------");
-    // Limpiar tinte para aislar el paso 3
-    proxy.taint_context.taint = TaintTag::CLEAN;
-    proxy.taint_context.is_external_egress = false;
+    // Se instancia un nuevo contexto limpio para aislar la prueba del paso 3 (el tinte es monotónico e irreversible)
+    proxy.taint_context = ProcessTaintContext::new(1001, "Agent-A-Requester", false);
 
     let injection_pkt = IpduPacket::propose_intent(
         SKILL_CLINICAL_NLP,
