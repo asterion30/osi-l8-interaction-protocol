@@ -18,7 +18,14 @@ struct DuplexPipe {
     writer: mpsc::Sender<u8>,
 }
 
-impl SetSocketTimeout for DuplexPipe {}
+impl SetSocketTimeout for DuplexPipe {
+    fn set_read_timeout(&self, _dur: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+    fn set_write_timeout(&self, _dur: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 impl DuplexPipe {
     fn pair() -> (Self, Self) {
@@ -453,6 +460,44 @@ fn test_full_5step_discovery_to_attest_flow() {
         *session.state(),
         SessionState::Terminated(TerminationReason::Completed)
     );
+
+    server_handle.join().unwrap();
+}
+
+#[test]
+fn test_fsm_responder_idle_handshake_timeout_on_partial_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Bind ephemeral listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server_handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut session = IlpSession::responder(IlpStream::new(stream))
+            .with_handshake_timeout(Duration::from_millis(60));
+
+        assert_eq!(*session.state(), SessionState::Idle);
+
+        // Debe expirar al esperar los 36 bytes canónicos completos si el cliente solo manda 10
+        let res = session.recv_packet();
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            IpduError::DeadlineExpired => {}
+            other => panic!("Esperado DeadlineExpired, recibido: {:?}", other),
+        }
+
+        assert_eq!(
+            *session.state(),
+            SessionState::Terminated(TerminationReason::Timeout)
+        );
+    });
+
+    let mut tcp_client = TcpStream::connect(addr).expect("Connect client to server");
+    // Enviar solo 10 bytes parciales (cabecera incompleta) y quedarse en silencio
+    let partial_bytes = [0x55u8; 10];
+    tcp_client.write_all(&partial_bytes).expect("Write partial");
+    tcp_client.flush().expect("Flush partial");
+
+    // Mantener la conexión abierta por 120 ms para forzar que el servidor corte por timeout
+    thread::sleep(Duration::from_millis(120));
 
     server_handle.join().unwrap();
 }

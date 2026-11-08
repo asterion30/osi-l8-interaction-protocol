@@ -20,7 +20,7 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 |                                                                         |
 |  [Paso 1: Taint Tracking] -> Auditoría de tinte (Medical/PII/Creds)     |
 |  [Paso 2: Reglas Declarativas] -> Presupuesto, TTL, Autonomía, Sandbox |
-|  [Paso 3: SLM Gatekeeper] -> Detección de inyecciones y exfiltración   |
+|  [Paso 3: HeuristicGatekeeper] -> Detección de inyecciones y exfiltración |
 |                                                                         |
 |         Veredicto: DROP (0 ns red)  ó  ALLOW (< 5 µs)                   |
 +-------------------------------------------------------------------------+
@@ -55,7 +55,7 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 # Compilar la biblioteca y binarios
 cargo build
 
-# Ejecutar la suite completa de tests unitarios y de integración (31 tests)
+# Ejecutar la suite completa de tests unitarios y de integración (47 tests)
 cargo test --all-targets --all-features
 
 # Comprobar análisis estático sin advertencias
@@ -72,7 +72,7 @@ cargo run --example live_agent_proxy
 Verás una salida en consola con marcas de tiempo en microsegundos ($\mu s$) y nanosegundos ($ns$):
 1. **Escenario 1 (Handshake Exitoso)**: Negociación de 3 vías (`DISCOVER_SKILL` -> `PROPOSE_INTENT` -> `COUNTER_OFFER` -> `COMMIT_CONTRACT`).
 2. **Escenario 2 (Bloqueo en el Borde - Taint Drop)**: Al adquirir tinte médico (`TaintTag::MEDICAL_PII`), el firewall descarta el paquete en menos de 500 ns sin que ningún byte toque el socket TCP.
-3. **Escenario 3 (Bloqueo por Inyección Adversaria)**: Intento de evasión detectado por el SLM Gatekeeper en el payload semántico.
+3. **Escenario 3 (Bloqueo por Inyección Adversaria)**: Intento de evasión detectado por el HeuristicGatekeeper en el payload semántico.
 4. **Resumen Forense**: Registro inmutable de eventos en el Ring Buffer de auditoría.
 
 ---
@@ -117,12 +117,12 @@ taint_context.apply_taint(
 use ilp_core::governance::Verdict;
 use ilp_core::ipdu::flags::CognitivePolicyFlags;
 use ilp_core::ipdu::packet::IpduPacket;
-use ilp_core::transport::{IlpSession, IlpStream};
+use ilp_core::transport::{IlpSession, IlpStream, SessionRole};
 use std::net::TcpStream;
 
-// Establecer conexión de red y sesión de Capa 8
+// Establecer conexión de red y sesión de Capa 8 especificando el rol FSM
 let stream = IlpStream::connect("127.0.0.1:8088").expect("Conexión TCP");
-let mut session = IlpSession::new(stream);
+let mut session = IlpSession::new(stream, SessionRole::Initiator);
 
 // Construir paquete inicial de descubrimiento o propuesta de intención
 let packet = IpduPacket::discover_skill(
@@ -138,6 +138,10 @@ let decision = firewall.inspect_egress(&taint_context, &packet);
 if decision.verdict == Verdict::Allow {
     // IlpSession valida automáticamente la máquina de estados y el session_uuid
     session.send_packet(&packet).expect("Envío conforme a la FSM");
+
+    // Acceso seguro y de solo lectura a la cabecera y el payload:
+    let _session_uuid = packet.header().session_uuid;
+    let _payload = packet.payload();
 } else {
     eprintln!("⛔ Paquete bloqueado por el firewall: {:?}", decision.reason);
     // Ningún byte tocó el socket de red
@@ -198,38 +202,35 @@ def agent_egress_hook(tool_call):
     return execute_remote_api(tool_call)
 ```
 
-### Entorno E: Adaptador para Model Context Protocol (MCP) de Anthropic
-El módulo `ilp_core::bridge` permite proteger llamadas MCP JSON-RPC (`tools/call`, `prompts/get`) activando el feature opcional `mcp`:
+### Entorno E: Adaptador y Proxy Sidecar para Model Context Protocol (MCP)
+El módulo `ilp_core::bridge` permite proteger llamadas MCP JSON-RPC (`tools/call`, `prompts/get`) activando el feature opcional `mcp`.
 
-```rust
-use ilp_core::bridge::{McpBridge, McpRpcRequest};
-use ilp_core::governance::Verdict;
+#### 1. Binario de Producción Autónomo (`ilp_mcp_sidecar`)
+El proyecto incluye un daemon independiente y configurable en `src/bin/ilp_mcp_sidecar.rs`:
 
-// 1. Recibir llamada JSON-RPC del cliente MCP (Claude Desktop, etc.)
-let rpc_call = McpRpcRequest::new_tool_call(
-    "call-01",
-    "database_query",
-    serde_json::json!({"sql": "SELECT * FROM analytics"}),
-);
+```bash
+# Validar sintaxis y configuración sin iniciar el servidor
+cargo run --bin ilp_mcp_sidecar --features mcp -- --check-config --policy policies/default_msac.conf
 
-// 2. Encapsular y auditar en sub-microsegundos con el MSAC
-let (packet, decision) = McpBridge::inspect_and_wrap(
-    &mut firewall,
-    &taint_context,
-    &rpc_call,
-    session_uuid,
-    100, // Presupuesto máximo
-    5_000,
-)?;
-
-if decision.verdict == Verdict::Allow {
-    stream.send_packet(&packet)?; // Transmitir trama I-PDU segura
-} else {
-    eprintln!("⛔ Bloqueo en el borde: {:?}", decision.reason);
-}
+# Iniciar el daemon sidecar interceptando JSON-RPC en el puerto 9001 y enviando I-PDU al puerto 9002
+cargo run --bin ilp_mcp_sidecar --features mcp -- --listen 127.0.0.1:9001 --gateway 127.0.0.1:9002 --policy policies/default_msac.conf
 ```
 
-Para probar el demo interactivo del escudo MCP:
+**Comportamiento Zero-Connect:** Ante cualquier solicitud que viole las políticas MSAC o el tinte, el sidecar responde inmediatamente con un error JSON-RPC y **jamás abre un socket TCP** hacia el gateway remoto. Además, limita estrictamente las líneas JSON-RPC entrantes a 64 KiB para prevenir ataques por agotamiento de memoria.
+
+#### 2. Servidores Programáticos (`McpSidecarServer` y `McpGatewayServer`)
+```rust
+use ilp_core::bridge::{McpGatewayServer, McpSidecarServer, SidecarConfig};
+
+// Gateway ILP: Recibe paquetes binarios I-PDU y despacha JSON-RPC al servidor de herramientas local
+let gateway = McpGatewayServer::start("127.0.0.1:9002", "127.0.0.1:8080".to_string(), SidecarConfig::default())?;
+
+// Sidecar MCP: Intercepta JSON-RPC, audita con MSAC (Zero-Connect) y reenvía tramas binarias al Gateway
+let sidecar = McpSidecarServer::start("127.0.0.1:9001", gateway.addr.clone(), firewall, taint_context, SidecarConfig::default())?;
+```
+
+#### 3. Demostración Interactiva del Escudo MCP
+Para probar el demo interactivo:
 ```bash
 cargo run --example mcp_shield_demo --features mcp
 ```

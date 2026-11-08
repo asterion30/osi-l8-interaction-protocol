@@ -27,6 +27,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "mcp")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "mcp")]
+use std::time::{Duration, Instant};
 
 /// Constante FNV-1a 64-bit Offset Basis.
 const FNV_OFFSET_BASIS_64: u64 = 0xcbf29ce484222325;
@@ -57,6 +59,10 @@ pub enum McpBridgeError {
     InvalidJsonRpc(String),
     /// Error a nivel del protocolo binario I-PDU.
     Protocol(IpduError),
+    /// El UUID de sesión de la respuesta no coincide con el registrado o la sesión no existe.
+    UnmatchedResponseUuid,
+    /// La tabla de correlación ha alcanzado su capacidad máxima permitida.
+    CapacityExceeded,
 }
 
 impl From<IpduError> for McpBridgeError {
@@ -71,6 +77,12 @@ impl fmt::Display for McpBridgeError {
             Self::UnsupportedMethod(m) => write!(f, "Método MCP no soportado: {}", m),
             Self::InvalidJsonRpc(msg) => write!(f, "JSON-RPC inválido: {}", msg),
             Self::Protocol(e) => write!(f, "Error de protocolo I-PDU: {}", e),
+            Self::UnmatchedResponseUuid => {
+                write!(f, "UUID de sesión no coincide con la petición registrada")
+            }
+            Self::CapacityExceeded => {
+                write!(f, "Capacidad máxima de correlación de sesiones excedida")
+            }
         }
     }
 }
@@ -137,15 +149,33 @@ impl McpRpcRequest {
 }
 
 #[cfg(feature = "mcp")]
-/// Tabla de correlación de sesiones en memoria para asociar `jsonrpc_id` a `session_uuid`.
+/// Capacidad máxima acotada para la tabla de correlación de sesiones concurrentes.
+pub const MAX_PENDING_SESSIONS: usize = 1024;
+
+#[cfg(feature = "mcp")]
+/// Sesión agéntica pendiente de resolución con marca temporal para expiración.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSession {
+    pub session_uuid: u64,
+    pub created_at: Instant,
+}
+
+#[cfg(feature = "mcp")]
+/// Tabla de correlación de sesiones en memoria con ámbito de cliente `(client_conn_id, request_id)` y TTL.
 ///
-/// **Nota de arquitectura:** `skill_namespace_hash` se deriva mediante FNV-1a para enrutamiento
-/// no criptográfico en $O(1)$, mientras que `session_uuid` se administra de manera unívoca
-/// y monotónica en esta tabla por conexión activa para vincular pares petición-respuesta.
-#[derive(Debug, Clone, Default)]
+/// **Invariante de seguridad:** Aísla las sesiones por conexión de cliente impidiendo colisiones entre clientes
+/// concurrentes que emitan el mismo `id` JSON-RPC (ej. `id: 1`). Consume y valida atómicamente el `session_uuid`.
+#[derive(Debug, Clone)]
 pub struct McpSessionCorrelationTable {
-    sessions: Arc<Mutex<HashMap<String, u64>>>,
+    sessions: Arc<Mutex<HashMap<(u64, String), PendingSession>>>,
     next_uuid: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "mcp")]
+impl Default for McpSessionCorrelationTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(feature = "mcp")]
@@ -158,25 +188,79 @@ impl McpSessionCorrelationTable {
         }
     }
 
-    /// Registra o recupera el `session_uuid` asociado al identificador JSON-RPC.
-    pub fn get_or_create_session(&self, jsonrpc_id: &serde_json::Value) -> u64 {
-        let key = match jsonrpc_id {
-            serde_json::Value::String(s) => s.clone(),
-            _ => jsonrpc_id.to_string(),
-        };
-        let mut map = self.sessions.lock().unwrap();
-        *map.entry(key)
-            .or_insert_with(|| self.next_uuid.fetch_add(1, Ordering::SeqCst))
+    /// Retorna la cantidad de sesiones pendientes activas.
+    pub fn len(&self) -> usize {
+        self.sessions.lock().unwrap().len()
     }
 
-    /// Valida y retira el `session_uuid` para una respuesta entrante con dicho `jsonrpc_id`.
-    pub fn resolve_session(&self, jsonrpc_id: &serde_json::Value) -> Option<u64> {
-        let key = match jsonrpc_id {
+    /// Indica si la tabla de correlación está vacía.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.lock().unwrap().is_empty()
+    }
+
+    /// Limpia las sesiones expiradas cuyo tiempo de creación supera el TTL dado.
+    pub fn purge_expired(&self, ttl: Duration) {
+        let now = Instant::now();
+        let mut map = self.sessions.lock().unwrap();
+        map.retain(|_, session| now.duration_since(session.created_at) <= ttl);
+    }
+
+    /// Registra una nueva sesión pendiente asociada al cliente y su ID JSON-RPC.
+    /// Ejecuta `purge_expired` antes de insertar y rechaza si se supera `MAX_PENDING_SESSIONS`.
+    pub fn register_session(
+        &self,
+        client_conn_id: u64,
+        jsonrpc_id: &serde_json::Value,
+        ttl: Duration,
+    ) -> Result<u64, McpBridgeError> {
+        self.purge_expired(ttl);
+
+        let key_str = match jsonrpc_id {
             serde_json::Value::String(s) => s.clone(),
             _ => jsonrpc_id.to_string(),
         };
+        let key = (client_conn_id, key_str);
+
         let mut map = self.sessions.lock().unwrap();
-        map.remove(&key)
+        if map.len() >= MAX_PENDING_SESSIONS && !map.contains_key(&key) {
+            return Err(McpBridgeError::CapacityExceeded);
+        }
+
+        let session_uuid = self.next_uuid.fetch_add(1, Ordering::SeqCst);
+        map.insert(
+            key,
+            PendingSession {
+                session_uuid,
+                created_at: Instant::now(),
+            },
+        );
+        Ok(session_uuid)
+    }
+
+    /// Resuelve y retira (consume) la sesión registrada, validando estrictamente que el
+    /// UUID recibido en la cabecera I-PDU entrante coincida con el registrado.
+    pub fn resolve_session(
+        &self,
+        client_conn_id: u64,
+        jsonrpc_id: &serde_json::Value,
+        incoming_session_uuid: u64,
+    ) -> Result<u64, McpBridgeError> {
+        let key_str = match jsonrpc_id {
+            serde_json::Value::String(s) => s.clone(),
+            _ => jsonrpc_id.to_string(),
+        };
+        let key = (client_conn_id, key_str);
+
+        let mut map = self.sessions.lock().unwrap();
+        match map.get(&key) {
+            Some(pending) if pending.session_uuid == incoming_session_uuid => {
+                let uuid = pending.session_uuid;
+                map.remove(&key);
+                Ok(uuid)
+            }
+            Some(_) => Err(McpBridgeError::UnmatchedResponseUuid),
+            None => Err(McpBridgeError::UnmatchedResponseUuid),
+        }
     }
 }
 
@@ -267,7 +351,7 @@ impl McpBridge {
     }
 
     #[cfg(feature = "mcp")]
-    /// Encapsula una respuesta MCP JSON-RPC dentro de un paquete `IpduPacket`.
+    /// Encapsula una respuesta MCP JSON-RPC dentro de un paquete `IpduPacket` con un `session_uuid` validado.
     ///
     /// Mapeo de campos:
     /// - `result != null` -> `Performative::AttestResult`
@@ -276,6 +360,7 @@ impl McpBridge {
     pub fn encapsulate_response(
         resp: &McpRpcResponse,
         skill_hash: u64,
+        session_uuid: u64,
         budget_spent: u32,
     ) -> Result<IpduPacket, McpBridgeError> {
         let performative = if resp.error.is_some() {
@@ -288,7 +373,6 @@ impl McpBridge {
             ));
         };
 
-        let session_uuid = Self::derive_session_uuid(&resp.id);
         let header = IpduHeader::new(
             performative,
             1,

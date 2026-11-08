@@ -10,12 +10,12 @@ Este documento detalla la metodología, cobertura y resultados de la suite de pr
 | :--- | :--- | :---: | :---: | :--- |
 | **I-PDU Wire Format** | `tests/test_ipdu_wire.rs` | 9 | **100% PASS** | Empaquetado binario Big-Endian, Word 0 bitfields, cabecera canónica (36B), cabecera compacta (32B), defensa anti Allocation Bomb, rechazo estricto de bytes sobrantes (`TrailingBytes`) y bounds checking. |
 | **Cognitive Firewall (MSAC)** | `tests/test_firewall_msac.rs` | 14 | **100% PASS** | Pipeline MSAC de 3 pasos: Taint Tracking monotónico con encapsulamiento estricto, cobertura exhaustiva de todas las etiquetas sensibles (`ALL_SENSITIVE`), parser declarativo `.conf` con rechazo de duplicados y límites de tier (<= 63), límites O(1), DLP/Prompt Injection y Ring Buffer acotado. |
-| **Transport Session & FSM** | `tests/test_transport_fsm.rs` | 6 | **100% PASS** | Máquina de estados finita por roles (`SessionRole::Initiator` vs `SessionRole::Responder`), mutación atómica post-E/S, verificación estricta de `session_uuid`, plazos monotónicos dinámicos con `SetSocketTimeout`, y flujo completo de 5 pasos desde `DiscoverSkill` hasta `AttestResult` sobre TCP real. |
+| **Transport Session & FSM** | `tests/test_transport_fsm.rs` | 7 | **100% PASS** | Máquina de estados finita por roles (`SessionRole::Initiator` vs `SessionRole::Responder`), mutación atómica post-E/S, verificación estricta de `session_uuid`, plazos monotónicos dinámicos con `SetSocketTimeout`, timeout inicial contra Slowloris en `Responder`, y flujo completo de 5 pasos desde `DiscoverSkill` hasta `AttestResult` sobre TCP real. |
 | **TCP Sockets & Transport** | `tests/test_tcp_transport.rs` | 4 | **100% PASS** | Framing sobre streams TCP reales, contención de Allocation Bomb y serialización/deserialización en bucle. |
-| **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 7 | **100% PASS** | Mapeo estricto de llamadas MCP JSON-RPC (`tools/call` -> `ProposeIntent`, `tools/list` -> `DiscoverSkill`), respuestas (`AttestResult`/`RejectPolicy`), rechazo de métodos desconocidos (`UnsupportedMethod`) y tabla de correlación en memoria. |
-| **MCP Proxy E2E Enforcement** | `tests/test_mcp_proxy_e2e.rs` | 1 | **100% PASS** | Túnel 100% binario I-PDU sobre `IlpStream` (`IlpMcpGateway` + `McpProxyRelay`), interceptando llamadas MCP y evaluando el firewall MSAC. **Demostración de No-Ejecución**: ante bloqueos (taint/prompt injection) ningún byte sale al gateway y la herramienta física jamás recibe tráfico. |
+| **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 9 | **100% PASS** | Mapeo estricto de llamadas MCP JSON-RPC (`tools/call` -> `ProposeIntent`, `tools/list` -> `DiscoverSkill`), respuestas (`AttestResult`/`RejectPolicy`), rechazo de métodos desconocidos (`UnsupportedMethod`), tabla de correlación con TTL, cota máxima (1024) y aislamiento de clientes. |
+| **MCP Proxy E2E Enforcement** | `tests/test_mcp_proxy_e2e.rs` | 3 | **100% PASS** | Servidores de producción (`McpSidecarServer` + `McpGatewayServer`) con túnel 100% binario I-PDU sobre `IlpStream`. **Demostración de No-Ejecución y Zero-Connect**: peticiones bloqueadas (taint/prompt injection) jamás abren sockets TCP al gateway. Rechazo estricto de líneas >64 KiB y aislamiento concurrente de clientes con `id: 1`. |
 | **Protocol Handshake** | `tests/test_handshake_simulation.rs` | 1 | **100% PASS** | Negociación completa del 3-Way Intent Handshake entre Cliente y Proveedor con auditoría en ambos firewalls. |
-| **Total General** | **7 Suites de Tests** | **42** | **42 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
+| **Total General** | **7 Suites de Tests** | **47** | **47 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
 
 ---
 
@@ -102,6 +102,8 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
    - Comprueba que la expiración del plazo monotónico (`deadline_ttl_ms`) culmine en `IpduError::DeadlineExpired` y estado `Terminated(Timeout)`.
 6. **`test_full_5step_discovery_to_attest_flow`**:
    - Valida el ciclo de vida completo de 5 pasos sobre sockets TCP reales: `DiscoverSkill` -> `DiscoverSkill` (anuncio) -> `ProposeIntent` -> `CounterOffer` -> `CommitContract` -> `AttestResult` -> `Terminated(Completed)`.
+7. **`test_fsm_responder_idle_handshake_timeout_on_partial_data`**:
+   - Valida que una sesión `Responder` en estado `Idle` expira y aborta con timeout ante datos parciales incompletos durante el handshake inicial (defensa anti-Slowloris).
 
 ---
 
@@ -121,11 +123,17 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
    - Valida el bloqueo de prompt injection al envolver llamadas MCP.
 7. **`test_mcp_inspect_and_wrap_taint_drop`**:
    - Valida el bloqueo por tinte activo al envolver llamadas MCP.
-8. **`test_mcp_proxy_e2e_real_enforcement`**:
-   - Levanta un `MockToolServer` sobre TCP para herramientas JSON-RPC.
-   - Levanta un `IlpGatewayServer` que recibe paquetes binarios `IpduPacket` vía `IlpStream` y los despacha al backend.
-   - Levanta un `IlpSidecarProxy` que intercepta llamadas MCP, evalúa el firewall MSAC y transmite 100% tramas binarias I-PDU hacia el gateway.
-   - **Prueba de No-Ejecución**: ante llamadas bloqueadas (tinte médico o prompt injection), ningún byte se emite al gateway y el contador atómico del servidor permanece inmutable.
+8. **`test_mcp_correlation_table_isolation_and_consumption`**:
+   - Valida el aislamiento estricto de clientes mediante clave compuesta `(client_conn_id, request_id)` y verificación de `session_uuid`.
+9. **`test_mcp_correlation_table_ttl_purging`**:
+   - Valida la purga automática por TTL y la cota superior `MAX_PENDING_SESSIONS` (1024).
+10. **`test_mcp_proxy_e2e_real_enforcement`**:
+    - Levanta servidores de producción `McpSidecarServer` y `McpGatewayServer` comunicándose por `IlpStream`.
+    - **Demostración de No-Ejecución y Zero-Connect**: ante bloqueos (tinte médico o prompt injection), el gateway jamás acepta conexiones TCP adicionales (`accepted_connections == 1`) y la herramienta física jamás recibe tráfico.
+11. **`test_mcp_proxy_line_length_rejection`**:
+    - Valida que líneas JSON-RPC de tamaño superior a 64 KiB sean rechazadas antes de conectar con el gateway (`accepted_connections == 0`).
+12. **`test_mcp_proxy_concurrent_clients_same_id`**:
+    - Valida la ausencia de colisiones y cross-talk cuando múltiples clientes concurrentes utilizan el mismo identificador (`"id": 1`).
 
 ---
 
@@ -147,5 +155,5 @@ cargo test --all-targets --all-features
 
 Salida esperada:
 ```text
-test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```

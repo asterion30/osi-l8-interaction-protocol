@@ -65,17 +65,15 @@ fn test_mcp_response_encapsulation_and_decapsulation() {
     };
 
     let skill_hash = 0xAAAA_BBBB_CCCC_DDDD;
+    let session_uuid = 0x1234_5678_90AB_CDEF;
     let budget_spent = 180;
 
-    let packet = McpBridge::encapsulate_response(&resp, skill_hash, budget_spent)
+    let packet = McpBridge::encapsulate_response(&resp, skill_hash, session_uuid, budget_spent)
         .expect("Encapsular respuesta MCP exitosa");
 
     assert_eq!(packet.header().performative, Performative::AttestResult);
     assert_eq!(packet.header().max_budget_cap, budget_spent);
-    assert_eq!(
-        packet.header().session_uuid,
-        McpBridge::derive_session_uuid(&resp.id)
-    );
+    assert_eq!(packet.header().session_uuid, session_uuid);
 
     let decoded_resp = McpBridge::decapsulate_response(&packet).expect("Desencapsular respuesta");
 
@@ -95,10 +93,12 @@ fn test_mcp_response_error_encapsulation() {
     };
 
     let skill_hash = 0xAAAA_BBBB_CCCC_DDDD;
-    let packet = McpBridge::encapsulate_response(&resp, skill_hash, 0)
+    let session_uuid = 0x9999_8888_7777_6666;
+    let packet = McpBridge::encapsulate_response(&resp, skill_hash, session_uuid, 0)
         .expect("Encapsular respuesta de error MCP");
 
     assert_eq!(packet.header().performative, Performative::RejectPolicy);
+    assert_eq!(packet.header().session_uuid, session_uuid);
 }
 
 #[test]
@@ -170,4 +170,73 @@ fn test_mcp_inspect_and_wrap_taint_drop() {
         decision.error_code,
         Some(CognitiveErrorCode::EpermCognitivePolicy)
     );
+}
+
+#[test]
+fn test_mcp_correlation_table_isolation_and_consumption() {
+    use ilp_core::bridge::McpSessionCorrelationTable;
+    use std::time::Duration;
+
+    let table = McpSessionCorrelationTable::new();
+    let ttl = Duration::from_secs(30);
+
+    let client_1 = 1001;
+    let client_2 = 1002;
+    let shared_id = json!("req-1");
+
+    // Ambos clientes usan el mismo ID JSON-RPC sin colisión
+    let uuid_1 = table
+        .register_session(client_1, &shared_id, ttl)
+        .expect("Register client 1");
+    let uuid_2 = table
+        .register_session(client_2, &shared_id, ttl)
+        .expect("Register client 2");
+
+    assert_ne!(uuid_1, uuid_2);
+    assert_eq!(table.len(), 2);
+
+    // Consumo estricto con UUID correcto
+    let resolved_1 = table
+        .resolve_session(client_1, &shared_id, uuid_1)
+        .expect("Resolve client 1");
+    assert_eq!(resolved_1, uuid_1);
+    assert_eq!(table.len(), 1);
+
+    // Re-intento de consumo falla (ya fue consumida)
+    assert_eq!(
+        table.resolve_session(client_1, &shared_id, uuid_1),
+        Err(McpBridgeError::UnmatchedResponseUuid)
+    );
+
+    // Intento con UUID incorrecto falla
+    assert_eq!(
+        table.resolve_session(client_2, &shared_id, 0xDEAD_BEEF),
+        Err(McpBridgeError::UnmatchedResponseUuid)
+    );
+
+    // Consumo correcto de cliente 2
+    let resolved_2 = table
+        .resolve_session(client_2, &shared_id, uuid_2)
+        .expect("Resolve client 2");
+    assert_eq!(resolved_2, uuid_2);
+    assert!(table.is_empty());
+}
+
+#[test]
+fn test_mcp_correlation_table_ttl_purging() {
+    use ilp_core::bridge::McpSessionCorrelationTable;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let table = McpSessionCorrelationTable::new();
+    let ttl = Duration::from_millis(20);
+
+    table
+        .register_session(1, &json!("req-fast"), ttl)
+        .expect("Register session");
+    assert_eq!(table.len(), 1);
+
+    sleep(Duration::from_millis(35));
+    table.purge_expired(ttl);
+    assert!(table.is_empty());
 }

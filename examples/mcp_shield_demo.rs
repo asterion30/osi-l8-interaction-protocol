@@ -98,6 +98,7 @@ fn main() {
     let response_packet = McpBridge::encapsulate_response(
         &mcp_response,
         packet.header().skill_namespace_hash,
+        packet.header().session_uuid,
         42, // Gasto real: 42 tokens
     )
     .expect("Encapsular respuesta");

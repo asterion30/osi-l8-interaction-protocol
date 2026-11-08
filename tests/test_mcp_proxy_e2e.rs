@@ -1,5 +1,6 @@
 #![cfg(feature = "mcp")]
 
+use ilp_core::bridge::{McpGatewayServer, McpSidecarServer, SidecarConfig};
 use ilp_core::governance::{
     CognitiveFirewall, ProcessTaintContext, TaintTag, UserGovernancePolicy,
 };
@@ -92,218 +93,6 @@ impl Drop for MockToolServer {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 }
-/// Gateway MCP Capa 8 del lado servidor.
-/// Escucha en TCP exclusivamente paquetes binarios `IpduPacket` sobre `IlpStream`.
-/// Desencapsula la llamada JSON-RPC original con `IlpMcpGateway::receive_and_unwrap`,
-/// ejecuta la llamada contra el `MockToolServer` y responde con `IlpMcpGateway::wrap_and_send_response`.
-struct IlpGatewayServer {
-    pub addr: String,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl IlpGatewayServer {
-    pub fn spawn(backend_addr: String) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind gateway server");
-        let addr = listener.local_addr().unwrap().to_string();
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let shut_clone = Arc::clone(&shutdown);
-
-        listener
-            .set_nonblocking(true)
-            .expect("Set non-blocking gateway");
-
-        thread::spawn(move || {
-            while !shut_clone.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let backend_target = backend_addr.clone();
-                        thread::spawn(move || {
-                            let mut ilp_stream = ilp_core::transport::IlpStream::new(stream);
-                            while let Ok((packet, mcp_req)) =
-                                ilp_core::bridge::IlpMcpGateway::receive_and_unwrap(&mut ilp_stream)
-                            {
-                                // Reenvío local JSON-RPC al MockToolServer
-                                if let Ok(mut backend) = TcpStream::connect(&backend_target) {
-                                    let mut req_str = serde_json::to_string(&mcp_req).unwrap();
-                                    req_str.push('\n');
-                                    let _ = backend.write_all(req_str.as_bytes());
-                                    let _ = backend.flush();
-
-                                    let mut backend_reader = BufReader::new(backend);
-                                    let mut backend_resp = String::new();
-                                    if backend_reader.read_line(&mut backend_resp).is_ok() {
-                                        if let Ok(mcp_resp) = serde_json::from_str::<
-                                            ilp_core::bridge::McpRpcResponse,
-                                        >(
-                                            &backend_resp
-                                        ) {
-                                            let _ =
-                                                ilp_core::bridge::IlpMcpGateway::wrap_and_send_response(
-                                                    &mcp_resp,
-                                                    packet.header().skill_namespace_hash,
-                                                    100,
-                                                    &mut ilp_stream,
-                                                );
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Self { addr, shutdown }
-    }
-}
-
-impl Drop for IlpGatewayServer {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-    }
-}
-
-/// Proxy Sidecar ILP (Capa 8) para clientes MCP.
-/// Recibe llamadas JSON-RPC del cliente y las audita con `CognitiveFirewall`.
-/// Si el veredicto es `Allow`, las envía como `IpduPacket` binario por `IlpStream` hacia el Gateway.
-/// Si es `Drop`, responde de inmediato con JSON-RPC de error sin emitir ningún byte a la red.
-struct IlpSidecarProxy {
-    pub addr: String,
-    #[allow(dead_code)]
-    pub taint_context: Arc<Mutex<ProcessTaintContext>>,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl IlpSidecarProxy {
-    pub fn spawn(gateway_addr: String, taint_context: Arc<Mutex<ProcessTaintContext>>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Bind proxy sidecar");
-        let addr = listener.local_addr().unwrap().to_string();
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let shut_clone = Arc::clone(&shutdown);
-        let taint_clone = Arc::clone(&taint_context);
-
-        listener
-            .set_nonblocking(true)
-            .expect("Set non-blocking proxy");
-
-        thread::spawn(move || {
-            let policy = UserGovernancePolicy {
-                deny_external_egress_if_tainted: true,
-                max_budget_cap: 10_000,
-                ..Default::default()
-            };
-            let firewall = CognitiveFirewall::new(policy);
-            let correlation = Arc::new(ilp_core::bridge::McpSessionCorrelationTable::new());
-
-            while !shut_clone.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((client_stream, _)) => {
-                        let gateway_target = gateway_addr.clone();
-                        let taint_ref = Arc::clone(&taint_clone);
-                        let mut firewall_clone = firewall.clone();
-                        let corr_ref = Arc::clone(&correlation);
-
-                        thread::spawn(move || {
-                            let mut client_reader =
-                                BufReader::new(client_stream.try_clone().unwrap());
-                            let mut client_writer = client_stream;
-                            let mut line = String::new();
-
-                            while let Ok(n) = client_reader.read_line(&mut line) {
-                                if n == 0 {
-                                    break;
-                                }
-
-                                if let Ok(gateway_tcp) = TcpStream::connect(&gateway_target) {
-                                    let mut ilp_stream =
-                                        ilp_core::transport::IlpStream::new(gateway_tcp);
-                                    let current_taint = taint_ref.lock().unwrap().clone();
-
-                                    match ilp_core::bridge::McpProxyRelay::handle_client_request(
-                                        &line,
-                                        &mut ilp_stream,
-                                        &mut firewall_clone,
-                                        &current_taint,
-                                        &corr_ref,
-                                        1_000,
-                                        5_000,
-                                    ) {
-                                        Ok(ilp_core::bridge::ClientIngressResult::Forwarded {
-                                            ..
-                                        }) => {
-                                            // Recibir respuesta binaria IpduPacket desde el Gateway
-                                            if let Ok(resp_packet) = ilp_stream.recv_packet() {
-                                                if let Ok(resp) =
-                                                    ilp_core::bridge::McpBridge::decapsulate_response(
-                                                        &resp_packet,
-                                                    )
-                                                {
-                                                    let mut resp_str =
-                                                        serde_json::to_string(&resp).unwrap();
-                                                    resp_str.push('\n');
-                                                    let _ =
-                                                        client_writer.write_all(resp_str.as_bytes());
-                                                    let _ = client_writer.flush();
-                                                }
-                                            }
-                                        }
-                                        Ok(ilp_core::bridge::ClientIngressResult::Blocked {
-                                            error_response,
-                                            ..
-                                        }) => {
-                                            let mut err_str = error_response.to_string();
-                                            err_str.push('\n');
-                                            let _ = client_writer.write_all(err_str.as_bytes());
-                                            let _ = client_writer.flush();
-                                        }
-                                        Err(e) => {
-                                            let err_resp = json!({
-                                                "jsonrpc": "2.0",
-                                                "id": null,
-                                                "error": {
-                                                    "code": -32600,
-                                                    "message": format!("ILP Protocol error: {}", e)
-                                                }
-                                            });
-                                            let mut err_str = err_resp.to_string();
-                                            err_str.push('\n');
-                                            let _ = client_writer.write_all(err_str.as_bytes());
-                                            let _ = client_writer.flush();
-                                        }
-                                    }
-                                }
-                                line.clear();
-                            }
-                        });
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Self {
-            addr,
-            taint_context,
-            shutdown,
-        }
-    }
-}
-
-impl Drop for IlpSidecarProxy {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-    }
-}
 
 fn send_mcp_request(addr: &str, req: &serde_json::Value) -> serde_json::Value {
     let mut stream = TcpStream::connect(addr).expect("Connect to proxy");
@@ -324,16 +113,35 @@ fn test_mcp_proxy_e2e_real_enforcement() {
     let mock_server = MockToolServer::spawn();
     assert_eq!(mock_server.executions.load(Ordering::SeqCst), 0);
 
-    // 2. Iniciar Gateway MCP ILP (habla 100% binario I-PDU hacia el proxy, y JSON-RPC hacia el backend)
-    let gateway = IlpGatewayServer::spawn(mock_server.addr.clone());
+    // 2. Iniciar Gateway MCP ILP de producción (Capa 8)
+    let gateway_config = SidecarConfig::default();
+    let gateway = McpGatewayServer::start("127.0.0.1:0", mock_server.addr.clone(), gateway_config)
+        .expect("Start gateway server");
+    assert_eq!(gateway.accepted_connections.load(Ordering::SeqCst), 0);
 
-    // 3. Iniciar Proxy Sidecar ILP (Capa 8) apuntando al Gateway por IlpStream binario
+    // 3. Iniciar Proxy Sidecar ILP (Capa 8) con firewall cognitivo y contexto de taint
     let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
         4096,
         "Claude-Worker",
         true, // external egress
     )));
-    let proxy = IlpSidecarProxy::spawn(gateway.addr.clone(), Arc::clone(&taint_context));
+
+    let policy = UserGovernancePolicy {
+        deny_external_egress_if_tainted: true,
+        max_budget_cap: 10_000,
+        ..Default::default()
+    };
+    let firewall = CognitiveFirewall::new(policy);
+    let sidecar_config = SidecarConfig::default();
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        Arc::clone(&taint_context),
+        sidecar_config,
+    )
+    .expect("Start sidecar server");
 
     // -------------------------------------------------------------------------
     // CASO 1: Llamada legítima con proceso limpio -> PERMITIDA Y EJECUTADA
@@ -350,7 +158,7 @@ fn test_mcp_proxy_e2e_real_enforcement() {
         }
     });
 
-    let resp1 = send_mcp_request(&proxy.addr, &req1);
+    let resp1 = send_mcp_request(&sidecar.addr, &req1);
     assert!(
         resp1.get("result").is_some(),
         "La respuesta debe ser exitosa: {:?}",
@@ -363,9 +171,15 @@ fn test_mcp_proxy_e2e_real_enforcement() {
         1,
         "La herramienta física debió ejecutarse exactamente 1 vez"
     );
+    // Verificar que el Gateway aceptó exactamente 1 conexión TCP
+    assert_eq!(
+        gateway.accepted_connections.load(Ordering::SeqCst),
+        1,
+        "El Gateway debió aceptar exactamente 1 conexión TCP para la petición permitida"
+    );
 
     // -------------------------------------------------------------------------
-    // CASO 2: Proceso contaminado con TaintTag::MEDICAL_PII -> BLOQUEO Y NO-EJECUCIÓN
+    // CASO 2: Proceso contaminado con TaintTag::MEDICAL_PII -> BLOQUEO ZERO-CONNECT
     // -------------------------------------------------------------------------
     {
         let mut ctx = taint_context.lock().unwrap();
@@ -384,7 +198,7 @@ fn test_mcp_proxy_e2e_real_enforcement() {
         }
     });
 
-    let resp2 = send_mcp_request(&proxy.addr, &req2);
+    let resp2 = send_mcp_request(&sidecar.addr, &req2);
     assert!(
         resp2.get("error").is_some(),
         "La respuesta debe contener un error de bloqueo: {:?}",
@@ -402,9 +216,15 @@ fn test_mcp_proxy_e2e_real_enforcement() {
         1,
         "DEMOSTRACIÓN DE NO-EJECUCIÓN: La herramienta física NUNCA fue ejecutada en la llamada bloqueada"
     );
+    // PRUEBA ZERO-CONNECT: El Gateway jamás recibió un socket TCP adicional
+    assert_eq!(
+        gateway.accepted_connections.load(Ordering::SeqCst),
+        1,
+        "ZERO-CONNECT: No se abrió ninguna conexión TCP al gateway en petición bloqueada por Taint"
+    );
 
     // -------------------------------------------------------------------------
-    // CASO 3: Intento de Prompt Injection en llamada -> BLOQUEO Y NO-EJECUCIÓN
+    // CASO 3: Intento de Prompt Injection en llamada -> BLOQUEO ZERO-CONNECT
     // -------------------------------------------------------------------------
     // Restaurar un contexto limpio sin taint de egreso
     {
@@ -425,7 +245,7 @@ fn test_mcp_proxy_e2e_real_enforcement() {
         }
     });
 
-    let resp3 = send_mcp_request(&proxy.addr, &req3);
+    let resp3 = send_mcp_request(&sidecar.addr, &req3);
     assert!(
         resp3.get("error").is_some(),
         "Prompt injection debe ser bloqueado: {:?}",
@@ -438,5 +258,142 @@ fn test_mcp_proxy_e2e_real_enforcement() {
         mock_server.executions.load(Ordering::SeqCst),
         1,
         "DEMOSTRACIÓN DE NO-EJECUCIÓN: Prompt injection bloqueado antes de alcanzar el Tool Server"
+    );
+    // PRUEBA ZERO-CONNECT: El Gateway sigue en 1 conexión
+    assert_eq!(
+        gateway.accepted_connections.load(Ordering::SeqCst),
+        1,
+        "ZERO-CONNECT: No se abrió ninguna conexión TCP al gateway en intento de Prompt Injection"
+    );
+}
+
+#[test]
+fn test_mcp_proxy_line_length_rejection() {
+    let mock_server = MockToolServer::spawn();
+    let gateway = McpGatewayServer::start(
+        "127.0.0.1:0",
+        mock_server.addr.clone(),
+        SidecarConfig::default(),
+    )
+    .expect("Start gateway");
+
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(5000, "Worker", false)));
+    let firewall = CognitiveFirewall::new(UserGovernancePolicy::default());
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        taint_context,
+        SidecarConfig::default(),
+    )
+    .expect("Start sidecar");
+
+    // Generar una línea JSON que supere los 64 KiB
+    let huge_padding = "A".repeat(65 * 1024);
+    let mut stream = TcpStream::connect(&sidecar.addr).expect("Connect to sidecar");
+    let payload = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"pad":"{}"}}}}"#,
+        huge_padding
+    );
+    let mut payload_nl = payload;
+    payload_nl.push('\n');
+    stream.write_all(payload_nl.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .expect("Read error line");
+
+    let err_json: serde_json::Value =
+        serde_json::from_str(&response_line).expect("Valid JSON response");
+    assert_eq!(err_json["error"]["code"], -32600);
+    assert!(err_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("64 KiB"));
+
+    // Cero conexiones deben haber alcanzado el Gateway
+    assert_eq!(
+        gateway.accepted_connections.load(Ordering::SeqCst),
+        0,
+        "Una línea de tamaño excesivo debe rechazarse antes de conectar al gateway"
+    );
+}
+
+#[test]
+fn test_mcp_proxy_concurrent_clients_same_id() {
+    let mock_server = MockToolServer::spawn();
+    let gateway = McpGatewayServer::start(
+        "127.0.0.1:0",
+        mock_server.addr.clone(),
+        SidecarConfig::default(),
+    )
+    .expect("Start gateway");
+
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
+        6000,
+        "ConcurrentWorker",
+        false,
+    )));
+    let firewall = CognitiveFirewall::new(UserGovernancePolicy::default());
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        taint_context,
+        SidecarConfig::default(),
+    )
+    .expect("Start sidecar");
+
+    let num_clients = 8;
+    let mut handles = Vec::new();
+
+    for i in 0..num_clients {
+        let sidecar_addr = sidecar.addr.clone();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(&sidecar_addr).expect("Connect concurrent client");
+            // Todos los clientes usan el id = 1
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "echo_service",
+                    "arguments": {
+                        "client_idx": i
+                    }
+                }
+            });
+            let mut payload = req.to_string();
+            payload.push('\n');
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.flush().unwrap();
+
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .expect("Read concurrent response");
+
+            let resp: serde_json::Value =
+                serde_json::from_str(&line).expect("Parse concurrent response");
+            assert_eq!(resp["id"], 1);
+            assert_eq!(resp["result"]["echo"]["client_idx"], i);
+        });
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(
+        mock_server.executions.load(Ordering::SeqCst),
+        num_clients,
+        "Todos los clientes concurrentes deben haber ejecutado exitosamente sin confusión de sesión"
     );
 }

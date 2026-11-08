@@ -78,7 +78,7 @@ El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento
 ## 🚀 Inicio Rápido (Quickstart)
 
 ```bash
-# 1. Ejecutar la suite completa de 42 pruebas de integración y unitarias
+# 1. Ejecutar la suite completa de 47 pruebas de integración y unitarias
 cargo test --all-targets --all-features
 
 # 2. Correr el benchmark formal reproducible y generar docs/BENCHMARK_RESULTS.md
@@ -255,16 +255,18 @@ osi-l8-interaction-protocol/
 │   ├── transport/                                        # Capa de transporte y sesión con estado
 │   │   ├── mod.rs                                        # IlpStream sobre sockets TCP / Read+Write
 │   │   └── session.rs                                    # IlpSession y FSM de 3-Way Intent Handshake
+│   ├── bin/
+│   │   └── ilp_mcp_sidecar.rs                            # Daemon autónomo CLI de producción MCP Sidecar
 │   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway)
 │   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 42 tests de integración y verificación E2E
+├── tests/                                                # 47 tests de integración y verificación E2E
 │   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking y simetría binaria (9 tests)
 │   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC (14 tests)
-│   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (6 tests)
+│   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (7 tests)
 │   ├── test_tcp_transport.rs                             # Sockets TCP reales y contención OOM (4 tests)
 │   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
-│   ├── test_mcp_bridge.rs                                # Mapeo estricto de métodos y error types (7 tests)
-│   └── test_mcp_proxy_e2e.rs                             # Túnel binario I-PDU MCP E2E con no-ejecución (1 test)
+│   ├── test_mcp_bridge.rs                                # Mapeo estricto, correlación con TTL y aislamiento (9 tests)
+│   └── test_mcp_proxy_e2e.rs                             # Túnel binario MCP E2E: Zero-Connect, cota 64 KiB y concurrencia (3 tests)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
     ├── live_agent_proxy.rs                               # Comunicación en vivo entre 2 agentes por TCP

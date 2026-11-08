@@ -81,14 +81,16 @@ enum Direction {
     Recv,
 }
 
+/// Timeout por defecto para el handshake inicial del Responder (5.000 ms).
+pub const DEFAULT_INITIAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(5_000);
+
 /// Helper trait para configurar timeouts sobre streams que lo soporten (como `TcpStream`).
+///
+/// **Invariante de seguridad:** Elimina cuerpos silenciosos por defecto para forzar que todo
+/// implementador configure verdaderamente el timeout del socket subyacente o devuelva error explícito.
 pub trait SetSocketTimeout {
-    fn set_read_timeout(&self, _dur: Option<Duration>) -> std::io::Result<()> {
-        Ok(())
-    }
-    fn set_write_timeout(&self, _dur: Option<Duration>) -> std::io::Result<()> {
-        Ok(())
-    }
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()>;
 }
 
 impl SetSocketTimeout for TcpStream {
@@ -101,7 +103,15 @@ impl SetSocketTimeout for TcpStream {
     }
 }
 
-impl<T> SetSocketTimeout for std::io::Cursor<T> {}
+impl<T> SetSocketTimeout for std::io::Cursor<T> {
+    fn set_read_timeout(&self, _dur: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _dur: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Gestor de sesión con estado que encapsula un `IlpStream` y gobierna la FSM.
 #[derive(Debug)]
@@ -112,6 +122,7 @@ pub struct IlpSession<S> {
     state: SessionState,
     session_deadline: Option<Instant>,
     deadline_ttl_ms: u32,
+    initial_handshake_timeout: Duration,
 }
 
 impl<S> IlpSession<S> {
@@ -124,7 +135,14 @@ impl<S> IlpSession<S> {
             state: SessionState::Idle,
             session_deadline: None,
             deadline_ttl_ms: 0,
+            initial_handshake_timeout: DEFAULT_INITIAL_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Configura el timeout de handshake inicial para proteger al Responder contra Slowloris.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.initial_handshake_timeout = timeout;
+        self
     }
 
     /// Constructor ergonómico para una sesión en rol Initiator (Cliente).
@@ -146,6 +164,7 @@ impl<S> IlpSession<S> {
             state: SessionState::Idle,
             session_deadline: None,
             deadline_ttl_ms: 0,
+            initial_handshake_timeout: DEFAULT_INITIAL_HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -413,7 +432,7 @@ impl<S: Read + Write + SetSocketTimeout> IlpSession<S> {
     /// Envía un paquete I-PDU a través de la sesión validando la máquina de estados de forma atómica.
     ///
     /// Aplica dinámicamente `remaining_duration()` como timeout de socket antes de la E/S.
-    /// Solo muta `self.state` y `self.session_uuid` si la escritura en el socket tiene éxito.
+    /// Solo muta `self.state`, `self.session_uuid` y `self.session_deadline` si la escritura en el socket tiene éxito.
     pub fn send_packet(&mut self, packet: &IpduPacket) -> Result<(), IpduError> {
         if !self.state.is_active() {
             return Err(IpduError::InvalidStateTransition {
@@ -422,18 +441,23 @@ impl<S: Read + Write + SetSocketTimeout> IlpSession<S> {
             });
         }
 
-        // 1. Inicializar deadline si el paquete declara un TTL y aún no se fijó
-        if packet.header().deadline_ttl_ms > 0 && self.session_deadline.is_none() {
-            self.set_deadline_ttl(packet.header().deadline_ttl_ms);
-        }
+        // 1. Calcular deadline candidato local sin mutar el estado permanentemente de antemano
+        let (cand_deadline, cand_ttl) =
+            if self.session_deadline.is_none() && packet.header().deadline_ttl_ms > 0 {
+                let dur = Duration::from_millis(packet.header().deadline_ttl_ms as u64);
+                (Some(Instant::now() + dur), packet.header().deadline_ttl_ms)
+            } else {
+                (self.session_deadline, self.deadline_ttl_ms)
+            };
 
         // 2. Verificar y configurar deadline en el socket antes de enviar
-        if let Some(rem) = self.remaining_duration() {
-            if rem.is_zero() {
+        if let Some(dl) = cand_deadline {
+            let now = Instant::now();
+            if now >= dl {
                 self.state = SessionState::Terminated(TerminationReason::Timeout);
                 return Err(IpduError::DeadlineExpired);
             }
-            self.stream.set_io_timeout(Some(rem))?;
+            self.stream.set_io_timeout(Some(dl - now))?;
         }
 
         // 3. Pre-validar consistencia de UUID y FSM sin mutar el estado
@@ -446,13 +470,16 @@ impl<S: Read + Write + SetSocketTimeout> IlpSession<S> {
         // 5. Mutación atómica post-éxito
         self.state = next_state;
         self.session_uuid = Some(next_uuid);
+        self.session_deadline = cand_deadline;
+        self.deadline_ttl_ms = cand_ttl;
 
         Ok(())
     }
 
     /// Recibe un paquete I-PDU desde el canal validando framing, session_uuid y transiciones de la FSM.
     ///
-    /// Aplica dinámicamente `remaining_duration()` como timeout de socket antes de la E/S.
+    /// Aplica `initial_handshake_timeout` en Responder en estado Idle (anti-Slowloris),
+    /// y dinámicamente `remaining_duration()` una vez establecido el handshake.
     pub fn recv_packet(&mut self) -> Result<IpduPacket, IpduError> {
         if !self.state.is_active() {
             return Err(IpduError::InvalidStateTransition {
@@ -461,8 +488,12 @@ impl<S: Read + Write + SetSocketTimeout> IlpSession<S> {
             });
         }
 
-        // 1. Verificar y configurar deadline en el socket antes de recibir
-        if let Some(rem) = self.remaining_duration() {
+        // 1. Configurar timeout antes de recibir:
+        // Si el Responder está en Idle, protege contra Slowloris aplicando initial_handshake_timeout.
+        if self.state == SessionState::Idle && self.role == SessionRole::Responder {
+            self.stream
+                .set_io_timeout(Some(self.initial_handshake_timeout))?;
+        } else if let Some(rem) = self.remaining_duration() {
             if rem.is_zero() {
                 self.state = SessionState::Terminated(TerminationReason::Timeout);
                 return Err(IpduError::DeadlineExpired);
