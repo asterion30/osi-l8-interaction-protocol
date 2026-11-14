@@ -23,10 +23,14 @@ fn print_help() {
           --gateway <IP:PUERTO>      Dirección del Gateway ILP remoto (default: 127.0.0.1:9002)\n  \
           --policy <RUTA>            Ruta al archivo de políticas MSAC (default: policies/default_msac.conf)\n  \
           --initial-taint <TAGS>     Etiquetas iniciales de tinte separadas por coma (ej. medical_pii,financial_data)\n  \
-          --psk <HEX_KEY>            Clave pre-compartida de 128 bits (32 caracteres hexadecimales) para firma de tramas\n  \
-          --allow-non-loopback       Permite enlazar a interfaces de red externas (requiere --psk)\n  \
+          --trust-client-claims      Acepta claims explícitos _ilp_taint_claim en solicitudes cliente (default: false)\n  \
+          --psk-file <RUTA>          Carga clave pre-compartida de 128 bits desde archivo (requiere permisos 0600 o 0400)\n  \
+          --psk <HEX_KEY>            [DEPRECATED/TEST-ONLY] Clave pre-compartida en línea de comandos (visible en /proc)\n  \
+          --allow-non-loopback       Permite enlazar a interfaces de red externas (requiere PSK)\n  \
           --check-config             Valida sintaxis de la política y configuración, saliendo con código 0\n  \
-          -h, --help                 Muestra esta ayuda y finaliza\n"
+          -h, --help                 Muestra esta ayuda y finaliza\n\n\
+        Variables de entorno:\n  \
+          ILP_PSK_HEX                Clave pre-compartida de 128 bits (32 dígitos hexadecimales)\n"
     );
 }
 
@@ -59,6 +63,47 @@ fn parse_hex_psk(hex_str: &str) -> Result<[u8; 16], String> {
 }
 
 #[cfg(feature = "mcp")]
+fn load_psk(psk_file: Option<&str>, psk_hex: Option<&str>) -> Result<Option<[u8; 16]>, String> {
+    if let Some(path) = psk_file {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(path)
+                .map_err(|e| format!("No se pudo acceder al archivo PSK '{}': {}", path, e))?;
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "Permisos inseguros en archivo PSK '{}' (modo {:o}): debe ser accesible solo por el propietario (chmod 600 o 400)",
+                    path, mode
+                ));
+            }
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Error al leer archivo PSK '{}': {}", path, e))?;
+        let key = parse_hex_psk(&content)?;
+        return Ok(Some(key));
+    }
+
+    if let Ok(env_val) = std::env::var("ILP_PSK_HEX") {
+        let trimmed = env_val.trim();
+        if !trimmed.is_empty() {
+            let key = parse_hex_psk(trimmed)?;
+            return Ok(Some(key));
+        }
+    }
+
+    if let Some(hex_key) = psk_hex {
+        eprintln!(
+            "Aviso de seguridad [DEPRECATED/TEST-ONLY]: Pasar la clave PSK como argumento de línea de comandos es inseguro (visible en /proc y ps); use --psk-file o la variable de entorno ILP_PSK_HEX en producción."
+        );
+        let key = parse_hex_psk(hex_key)?;
+        return Ok(Some(key));
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "mcp")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -67,6 +112,8 @@ fn main() {
     let mut policy_path = "policies/default_msac.conf".to_string();
     let mut initial_taint_str: Option<String> = None;
     let mut psk_str: Option<String> = None;
+    let mut psk_file_path: Option<String> = None;
+    let mut trust_client_claims = false;
     let mut allow_non_loopback = false;
     let mut check_config_only = false;
 
@@ -83,6 +130,10 @@ fn main() {
             }
             "--allow-non-loopback" => {
                 allow_non_loopback = true;
+                i += 1;
+            }
+            "--trust-client-claims" => {
+                trust_client_claims = true;
                 i += 1;
             }
             "--listen" => {
@@ -137,6 +188,19 @@ fn main() {
                 initial_taint_str = Some(opt.trim_start_matches("--initial-taint=").to_string());
                 i += 1;
             }
+            "--psk-file" => {
+                if i + 1 < args.len() {
+                    psk_file_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --psk-file requiere una ruta de archivo");
+                    std::process::exit(1);
+                }
+            }
+            opt if opt.starts_with("--psk-file=") => {
+                psk_file_path = Some(opt.trim_start_matches("--psk-file=").to_string());
+                i += 1;
+            }
             "--psk" => {
                 if i + 1 < args.len() {
                     psk_str = Some(args[i + 1].clone());
@@ -177,22 +241,19 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Parsear PSK si fue proporcionada
-    let parsed_psk = match psk_str {
-        Some(ref s) => match parse_hex_psk(s) {
-            Ok(key) => Some(key),
-            Err(e) => {
-                eprintln!("Error: --psk inválida: {}", e);
-                std::process::exit(1);
-            }
-        },
-        None => None,
+    // Cargar PSK con orden de prioridad: --psk-file > ILP_PSK_HEX > --psk
+    let parsed_psk = match load_psk(psk_file_path.as_deref(), psk_str.as_deref()) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("Error de clave PSK: {}", e);
+            std::process::exit(1);
+        }
     };
 
     // Guardarraíl de seguridad para interfaces de red no-loopback
     if !listen_addr.ip().is_loopback() && (!allow_non_loopback || parsed_psk.is_none()) {
         eprintln!(
-            "Error de seguridad: el enlace a una interfaz de red no-loopback ({}) requiere la especificación explícita de --allow-non-loopback y una clave pre-compartida (--psk <HEX_KEY>)",
+            "Error de seguridad: el enlace a una interfaz de red no-loopback ({}) requiere la especificación explícita de --allow-non-loopback y una clave pre-compartida (vía --psk-file, ILP_PSK_HEX o --psk)",
             listen_addr
         );
         std::process::exit(1);
@@ -267,6 +328,7 @@ fn main() {
             }
         );
         println!("  - Initial Taint:   {} etiquetas", initial_tags.len());
+        println!("  - Trust Client Claims: {}", trust_client_claims);
         std::process::exit(0);
     }
 
@@ -285,6 +347,14 @@ fn main() {
             "Inactiva (Dev Mode)"
         }
     );
+    println!(
+        "• Trust Client Claims:   {}",
+        if trust_client_claims {
+            "Habilitado (claims cliente aceptados)"
+        } else {
+            "Deshabilitado (default seguro)"
+        }
+    );
 
     let firewall = CognitiveFirewall::new(policy);
     let mut process_ctx = ProcessTaintContext::new(std::process::id(), "ilp_mcp_sidecar", true);
@@ -298,6 +368,7 @@ fn main() {
 
     let config = SidecarConfig {
         psk: parsed_psk,
+        trust_client_taint_claims: trust_client_claims,
         ..Default::default()
     };
 

@@ -211,3 +211,69 @@ fn test_full_binary_e2e_authenticated_flow() {
 
     shutdown.store(true, Ordering::SeqCst);
 }
+
+#[test]
+fn test_cli_binaries_psk_file_and_env_loading() {
+    let sidecar_bin = env!("CARGO_BIN_EXE_ilp_mcp_sidecar");
+    let gateway_bin = env!("CARGO_BIN_EXE_ilp_mcp_gateway");
+
+    let tmp_dir = std::env::temp_dir();
+    let psk_path = tmp_dir.join(format!("test_ilp_psk_{}.key", std::process::id()));
+    std::fs::write(&psk_path, "00112233445566778899aabbccddeeff\n").expect("Write PSK file");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&psk_path, std::fs::Permissions::from_mode(0o600))
+            .expect("Set 0600 permissions");
+    }
+
+    // 1. Carga válida desde archivo con permisos seguros (0600)
+    let sc_status = Command::new(sidecar_bin)
+        .args(["--check-config", "--psk-file", psk_path.to_str().unwrap()])
+        .status()
+        .expect("Execute sidecar with --psk-file");
+    assert!(
+        sc_status.success(),
+        "Sidecar debe aceptar --psk-file con permisos 0600"
+    );
+
+    let gw_status = Command::new(gateway_bin)
+        .args(["--check-config", "--psk-file", psk_path.to_str().unwrap()])
+        .status()
+        .expect("Execute gateway with --psk-file");
+    assert!(
+        gw_status.success(),
+        "Gateway debe aceptar --psk-file con permisos 0600"
+    );
+
+    // 2. Rechazo por permisos inseguros (0666 en Unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&psk_path, std::fs::Permissions::from_mode(0o666))
+            .expect("Set 0666 permissions");
+
+        let insecure_status = Command::new(sidecar_bin)
+            .args(["--check-config", "--psk-file", psk_path.to_str().unwrap()])
+            .status()
+            .expect("Execute sidecar with insecure psk file");
+        assert!(
+            !insecure_status.success(),
+            "Sidecar DEBE rechazar archivo PSK con permisos 0666 (inseguros)"
+        );
+    }
+
+    // 3. Carga válida mediante variable de entorno ILP_PSK_HEX
+    let env_status = Command::new(sidecar_bin)
+        .args(["--check-config"])
+        .env("ILP_PSK_HEX", "00112233445566778899aabbccddeeff")
+        .status()
+        .expect("Execute sidecar with ILP_PSK_HEX");
+    assert!(
+        env_status.success(),
+        "Sidecar debe cargar clave desde ILP_PSK_HEX"
+    );
+
+    let _ = std::fs::remove_file(&psk_path);
+}

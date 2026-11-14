@@ -261,20 +261,24 @@ osi-l8-interaction-protocol/
 │   │   └── ilp_mcp_gateway.rs                            # Daemon autónomo CLI de producción MCP Gateway
 │   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway)
 │   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 54 tests de integración y verificación E2E
+├── tests/                                                # 62 tests de integración y verificación E2E (100% pasando)
 │   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking y simetría binaria (9 tests)
 │   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC (14 tests)
 │   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (7 tests)
 │   ├── test_tcp_transport.rs                             # Sockets TCP reales y contención OOM (4 tests)
 │   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
 │   ├── test_mcp_bridge.rs                                # Mapeo estricto, correlación con TTL, purga e in-flight (11 tests)
-│   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: Zero-Connect, cota 64 KiB, Slowloris, PSK MAC (7 tests)
-│   └── test_cli_binaries.rs                              # Smoke tests subprocess de CLI Gateway y Sidecar (4 tests)
+│   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: Zero-Connect, cota 64 KiB, Slowloris, PSK MAC, ReplayGuard (10 tests)
+│   └── test_cli_binaries.rs                              # Subprocess smoke tests CLI Gateway y Sidecar, PSK file/env (5 tests)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
     ├── live_agent_proxy.rs                               # Comunicación en vivo entre 2 agentes por TCP
     └── mcp_shield_demo.rs                                # Demostración del escudo MCP contra Prompt Injection
 ```
+
+> [!NOTE]
+> **Alcance del DLP Heurístico y Cifrado de Transporte:**
+> La inspección semántica y el auto-manchado por DLP (`HeuristicGatekeeper`) analizan cargas útiles en texto claro decodificado en el host. Para garantizar confidencialidad contra adversarios de red (man-in-the-middle), los túneles TCP entre Sidecar y Gateway deben combinarse con mTLS o VPN wire-level (WireGuard). La autenticación SipHash-2-4 de Capa 8 provee integridad de trama y autenticación de origen sin cifrado de contenido.
 
 ---
 

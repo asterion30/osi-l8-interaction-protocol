@@ -26,6 +26,8 @@ use crate::ipdu::packet::IpduPacket;
 #[cfg(feature = "mcp")]
 use crate::transport::IlpStream;
 #[cfg(feature = "mcp")]
+use std::collections::HashMap;
+#[cfg(feature = "mcp")]
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(feature = "mcp")]
 use std::net::{TcpListener, TcpStream};
@@ -50,6 +52,7 @@ pub enum ProxyError {
     RequestDeadlineExceeded,
     McpBridge(McpBridgeError),
     AuthFailed(String),
+    ReplayDetected,
 }
 
 #[cfg(feature = "mcp")]
@@ -65,6 +68,12 @@ impl std::fmt::Display for ProxyError {
             }
             Self::McpBridge(e) => write!(f, "Error en adaptador MCP: {}", e),
             Self::AuthFailed(msg) => write!(f, "Fallo de autenticación: {}", msg),
+            Self::ReplayDetected => {
+                write!(
+                    f,
+                    "Replay attack detected: duplicate negotiation session UUID"
+                )
+            }
         }
     }
 }
@@ -104,6 +113,8 @@ pub struct SidecarConfig {
     pub deadline_ttl_ms: u32,
     /// Clave pre-compartida (PSK) opcional de 128 bits para autenticación MAC de tramas.
     pub psk: Option<[u8; 16]>,
+    /// Si es false (default en producción), ignora claims de tinte no autenticados enviados por el cliente.
+    pub trust_client_taint_claims: bool,
 }
 
 #[cfg(feature = "mcp")]
@@ -117,6 +128,7 @@ impl Default for SidecarConfig {
             budget_cap: 10_000,
             deadline_ttl_ms: 5_000,
             psk: None,
+            trust_client_taint_claims: false,
         }
     }
 }
@@ -134,17 +146,23 @@ pub struct ConnectionPermit {
 
 #[cfg(feature = "mcp")]
 impl ConnectionPermit {
-    /// Intenta adquirir atómicamente un permiso de conexión mediante CAS (Compare-And-Swap).
-    #[allow(deprecated)]
+    /// Intenta adquirir atómicamente un permiso de conexión mediante CAS (Compare-And-Swap) con `compare_exchange_weak`.
     pub fn try_acquire(counter: Arc<AtomicUsize>, max: usize) -> Option<Self> {
-        let res = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |curr| {
-            if curr < max {
-                Some(curr + 1)
-            } else {
-                None
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= max {
+                return None;
             }
-        });
-        res.ok().map(|_| Self { counter })
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { counter }),
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
@@ -152,6 +170,67 @@ impl ConnectionPermit {
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "mcp")]
+/// Registro de protección anti-replay para tramas I-PDU en espacio de usuario.
+///
+/// Rastrea los `session_uuid` observados dentro de una ventana de tiempo acotada (`window_ttl`)
+/// y una capacidad máxima (`max_entries`). Cualquier retransmisión de un UUID idéntico dentro de
+/// la ventana es rechazada para mitigar ataques de repetición.
+#[derive(Debug)]
+pub struct ReplayGuard {
+    seen: HashMap<u64, Instant>,
+    window_ttl: Duration,
+    max_entries: usize,
+}
+
+#[cfg(feature = "mcp")]
+impl ReplayGuard {
+    /// Crea un nuevo guardián anti-replay con la ventana temporal y capacidad especificadas.
+    pub fn new(window_ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            seen: HashMap::new(),
+            window_ttl,
+            max_entries,
+        }
+    }
+
+    /// Purga las entradas expiradas más allá de `window_ttl`.
+    pub fn purge_expired(&mut self) {
+        let now = Instant::now();
+        let ttl = self.window_ttl;
+        self.seen
+            .retain(|_, timestamp| now.duration_since(*timestamp) < ttl);
+    }
+
+    /// Verifica si un `session_uuid` ya fue procesado.
+    ///
+    /// Si ya existe dentro de la ventana de validez, retorna `Err(ProxyError::ReplayDetected)`.
+    /// En caso contrario, lo registra y retorna `Ok(())`.
+    pub fn check_and_record(&mut self, session_uuid: u64) -> Result<(), ProxyError> {
+        self.purge_expired();
+        let now = Instant::now();
+        if let Some(timestamp) = self.seen.get(&session_uuid) {
+            if now.duration_since(*timestamp) < self.window_ttl {
+                return Err(ProxyError::ReplayDetected);
+            }
+        }
+        if self.seen.len() >= self.max_entries {
+            if let Some(&oldest_key) = self.seen.iter().min_by_key(|(_, &ts)| ts).map(|(k, _)| k) {
+                self.seen.remove(&oldest_key);
+            }
+        }
+        self.seen.insert(session_uuid, now);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl Default for ReplayGuard {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(60), 4096)
     }
 }
 
@@ -174,7 +253,9 @@ pub fn read_bounded_line_with_deadline(
             .ok_or(ProxyError::RequestDeadlineExceeded)?;
 
         let timeout_to_set = remaining.max(Duration::from_millis(1));
-        let _ = stream.set_read_timeout(Some(timeout_to_set));
+        stream
+            .set_read_timeout(Some(timeout_to_set))
+            .map_err(ProxyError::Io)?;
 
         let mut chunk = String::new();
         let take_limit = (max_bytes + 1).saturating_sub(line.len()) as u64;
@@ -382,6 +463,9 @@ impl McpSidecarServer {
                             let mut client_reader = BufReader::new(reader_stream);
                             let mut client_writer = client_stream;
 
+                            // Aislamiento de tinte por cliente: cada conexión inicia con una copia del contexto global
+                            let mut client_taint = taint_ref.lock().unwrap().clone();
+
                             loop {
                                 let line = match read_bounded_line_with_deadline(
                                     &client_writer,
@@ -429,28 +513,28 @@ impl McpSidecarServer {
                                 };
 
                                 // Inspección de claims de tinte explícitos en los parámetros de la solicitud
-                                if let Ok(req_val) =
-                                    serde_json::from_str::<serde_json::Value>(&line)
-                                {
-                                    if let Some(claim) = req_val
-                                        .get("params")
-                                        .and_then(|p| p.get("_ilp_taint_claim"))
-                                        .and_then(|c| c.as_str())
+                                // Solo se aceptan si trust_client_taint_claims está explícitamente habilitado
+                                if cfg.trust_client_taint_claims {
+                                    if let Ok(req_val) =
+                                        serde_json::from_str::<serde_json::Value>(&line)
                                     {
-                                        if let Some(tag) = TaintTag::from_name(claim) {
-                                            taint_ref
-                                                .lock()
-                                                .unwrap()
-                                                .apply_taint(tag, "mcp:client:taint_claim");
+                                        if let Some(claim) = req_val
+                                            .get("params")
+                                            .and_then(|p| p.get("_ilp_taint_claim"))
+                                            .and_then(|c| c.as_str())
+                                        {
+                                            if let Some(tag) = TaintTag::from_name(claim) {
+                                                client_taint
+                                                    .apply_taint(tag, "mcp:client:taint_claim");
+                                            }
                                         }
                                     }
                                 }
 
-                                let current_taint = taint_ref.lock().unwrap().clone();
                                 match McpProxyRelay::evaluate_client_request(
                                     &line,
                                     &mut firewall_clone,
-                                    &current_taint,
+                                    &client_taint,
                                     &corr_ref,
                                     client_conn_id,
                                     cfg.budget_cap,
@@ -510,12 +594,13 @@ impl McpSidecarServer {
                                                         }
 
                                                         // Taint Ingress Tracking: Detección dinámica de datos sensibles en la respuesta
+                                                        // Afecta exclusivamente al contexto de tinte aislado de este cliente
                                                         let detected_tags =
                                                             HeuristicGatekeeper::detect_sensitive_classes(
                                                                 resp_packet.payload(),
                                                             );
                                                         for tag in detected_tags {
-                                                            taint_ref.lock().unwrap().apply_taint(
+                                                            client_taint.apply_taint(
                                                                 tag,
                                                                 "mcp:ingress:tool_response",
                                                             );
@@ -690,10 +775,12 @@ impl McpGatewayServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let accepted_connections = Arc::new(AtomicUsize::new(0));
         let active_connections = Arc::new(AtomicUsize::new(0));
+        let replay_guard = Arc::new(Mutex::new(ReplayGuard::new(Duration::from_secs(60), 4096)));
 
         let shut_clone = Arc::clone(&shutdown);
         let accepted_clone = Arc::clone(&accepted_connections);
         let active_clone = Arc::clone(&active_connections);
+        let replay_clone = Arc::clone(&replay_guard);
 
         thread::spawn(move || {
             while !shut_clone.load(Ordering::SeqCst) {
@@ -711,6 +798,7 @@ impl McpGatewayServer {
 
                         let backend_target = tool_server_addr.clone();
                         let cfg = config.clone();
+                        let replay_ref = Arc::clone(&replay_clone);
 
                         thread::spawn(move || {
                             let _permit = permit;
@@ -718,10 +806,8 @@ impl McpGatewayServer {
                             let _ = stream.set_write_timeout(Some(cfg.io_timeout));
 
                             let mut ilp_stream = IlpStream::new(stream);
-                            while let Ok((packet, mcp_req)) =
-                                IlpMcpGateway::receive_and_unwrap(&mut ilp_stream)
-                            {
-                                // Verificación de MAC en la trama recibida si PSK está configurada
+                            while let Ok(packet) = ilp_stream.recv_packet() {
+                                // 1. Verify-Then-Parse: Verificación de MAC en la trama recibida si PSK está configurada
                                 if let Some(ref key) = cfg.psk {
                                     if !verify_frame_mac(
                                         packet.header(),
@@ -731,7 +817,7 @@ impl McpGatewayServer {
                                     ) {
                                         let err_resp = McpRpcResponse {
                                             jsonrpc: "2.0".to_string(),
-                                            id: mcp_req.id.clone(),
+                                            id: serde_json::Value::Null,
                                             result: None,
                                             error: Some(serde_json::json!({
                                                 "code": -32001,
@@ -757,6 +843,77 @@ impl McpGatewayServer {
                                         continue;
                                     }
                                 }
+
+                                // 2. Anti-Replay Guard: Detección y rechazo de tramas con session_uuid duplicado
+                                if let Err(ProxyError::ReplayDetected) = replay_ref
+                                    .lock()
+                                    .unwrap()
+                                    .check_and_record(packet.header().session_uuid)
+                                {
+                                    let err_resp = McpRpcResponse {
+                                        jsonrpc: "2.0".to_string(),
+                                        id: serde_json::Value::Null,
+                                        result: None,
+                                        error: Some(serde_json::json!({
+                                            "code": -32003,
+                                            "message": "Replay attack detected: duplicate negotiation session UUID"
+                                        })),
+                                    };
+                                    let mut resp_pkt = match McpBridge::encapsulate_response(
+                                        &err_resp,
+                                        packet.header().skill_namespace_hash,
+                                        packet.header().session_uuid,
+                                        0,
+                                    ) {
+                                        Ok(p) => p,
+                                        Err(_) => break,
+                                    };
+                                    if let Some(ref key) = cfg.psk {
+                                        let mac = compute_frame_mac(
+                                            resp_pkt.header(),
+                                            resp_pkt.payload(),
+                                            key,
+                                        );
+                                        resp_pkt.set_user_rule_sig_hash(mac);
+                                    }
+                                    let _ = ilp_stream.send_packet(&resp_pkt);
+                                    continue;
+                                }
+
+                                // 3. Deserialización JSON-RPC SOLO tras pasar validación de MAC y Replay
+                                let mcp_req = match McpBridge::unwrap_packet(&packet) {
+                                    Ok(req) => req,
+                                    Err(e) => {
+                                        let err_resp = McpRpcResponse {
+                                            jsonrpc: "2.0".to_string(),
+                                            id: serde_json::Value::Null,
+                                            result: None,
+                                            error: Some(serde_json::json!({
+                                                "code": -32700,
+                                                "message": format!("Parse error: {}", e)
+                                            })),
+                                        };
+                                        let mut resp_pkt = match McpBridge::encapsulate_response(
+                                            &err_resp,
+                                            packet.header().skill_namespace_hash,
+                                            packet.header().session_uuid,
+                                            0,
+                                        ) {
+                                            Ok(p) => p,
+                                            Err(_) => break,
+                                        };
+                                        if let Some(ref key) = cfg.psk {
+                                            let mac = compute_frame_mac(
+                                                resp_pkt.header(),
+                                                resp_pkt.payload(),
+                                                key,
+                                            );
+                                            resp_pkt.set_user_rule_sig_hash(mac);
+                                        }
+                                        let _ = ilp_stream.send_packet(&resp_pkt);
+                                        continue;
+                                    }
+                                };
 
                                 // Comunicación con el servidor de herramientas de backend
                                 let backend_result = (|| -> Result<McpRpcResponse, String> {

@@ -55,7 +55,7 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 # Compilar la biblioteca y binarios
 cargo build
 
-# Ejecutar la suite completa de tests unitarios y de integración (54 tests)
+# Ejecutar la suite completa de tests unitarios y de integración (62 tests)
 cargo test --all-targets --all-features
 
 # Comprobar análisis estático sin advertencias
@@ -230,22 +230,28 @@ En entornos con **Docker / Kubernetes**, se confina el runtime del agente en una
 
 #### 2. Autenticación Criptográfica de Trama con Clave Pre-compartida (PSK / SipHash-2-4)
 
-Para impedir la inyección directa de tramas I-PDU espurias contra el Gateway, ambos daemons (`ilp_mcp_sidecar` e `ilp_mcp_gateway`) soportan autenticación de integridad basada en SipHash-2-4 con clave de 128 bits (`--psk <HEX_KEY>`):
-- El Sidecar firma criptográficamente los primeros 28 bytes de la cabecera canónica + payload e inserta el MAC resultante en el campo `user_rule_sig_hash` de la cabecera.
-- El Gateway verifica la firma antes de procesar o despachar cualquier llamada al servidor de herramientas. Si la clave no coincide o la trama fue alterada, el Gateway responde con `Performative::RejectPolicy` y código JSON-RPC `-32001`.
-- **Guardrail de red no-loopback:** El enlace a interfaces de red externas (`0.0.0.0` o IPs públicas) está bloqueado por defecto; requiere la presencia explícita de `--allow-non-loopback` y una clave `--psk`.
+Para impedir la inyección directa de tramas I-PDU espurias contra el Gateway, ambos daemons (`ilp_mcp_sidecar` e `ilp_mcp_gateway`) soportan autenticación de integridad basada en SipHash-2-4 con clave de 128 bits:
+- **Carga Segura de Clave (Prioridad de Carga)**:
+  1. `--psk-file <PATH>`: Carga la clave desde un archivo protegido con permisos estrictos de Unix (`0600` o `0400`, accesible solo por el propietario). Permisos más laxos son rechazados inmediatamente por seguridad.
+  2. `ILP_PSK_HEX`: Variable de entorno con la clave en hexadecimal (32 caracteres).
+  3. `--psk <HEX_KEY>`: [DEPRECATED / TEST-ONLY] Argumento en línea de comandos (emite advertencia de seguridad debido a su visibilidad en `/proc` y `ps`).
+- **Invariante Verify-Then-Parse**: El Gateway recibe la trama cruda y valida el MAC antes de invocar cualquier deserializador JSON-RPC. Si la firma es inválida, se devuelve de inmediato `Performative::RejectPolicy` con código `-32001` sin procesar el contenido de la carga útil.
+- **Protección Anti-Replay (`ReplayGuard`)**: El Gateway mantiene un registro acotado de `session_uuid` observados con ventana temporal de 60 segundos y capacidad máxima de 4096 entradas. Cualquier trama retransmitida con UUID duplicado es descartada con error `-32003` ("Replay attack detected").
+- **Aislamiento de Tinte por Conexión**: Cada cliente que se conecta al Sidecar opera sobre una copia aislada del contexto de tinte. Los datos sensibles detectados en respuestas de herramientas o claims explícitos solo afectan a esa conexión específica, garantizando que un cliente manchado no contamine a otros clientes.
+- **Control de Claims de Cliente (`--trust-client-claims`)**: Por defecto (`false`), los daemons descartan claims `_ilp_taint_claim` no autenticados enviados por clientes. Requiere la bandera explícita `--trust-client-claims` para habilitar el auto-etiquetado voluntario por parte del cliente.
+- **Guardrail de red no-loopback:** El enlace a interfaces de red externas (`0.0.0.0` o IPs públicas) está bloqueado por defecto; requiere la presencia explícita de `--allow-non-loopback` y una clave pre-compartida válida.
 
 #### 3. Daemons de Producción Autónomos (`ilp_mcp_sidecar` y `ilp_mcp_gateway`)
 
 El proyecto provee dos binarios de línea de comandos independientes:
 
 - **`ilp_mcp_sidecar`**: Intercepta tráfico JSON-RPC del agente, audita con MSAC (Zero-Connect: jamás abre TCP al gateway si la política rechaza), auto-mancha dinámicamente el proceso ante respuestas con datos sensibles (`DLP Ingress`), firma tramas con PSK y maneja concurrencia atómica (CAS) sin condiciones de carrera.
-- **`ilp_mcp_gateway`**: Recibe paquetes binarios I-PDU del sidecar sobre `IlpStream`, verifica la autenticación PSK, despacha JSON-RPC al backend de herramientas MCP y propaga errores estructurados (`-32002`) si el backend está inalcanzable.
+- **`ilp_mcp_gateway`**: Recibe paquetes binarios I-PDU del sidecar sobre `IlpStream`, ejecuta Verify-Then-Parse y filtrado anti-replay, despacha JSON-RPC al backend de herramientas MCP y propaga errores estructurados (`-32002`) si el backend está inalcanzable.
 
 ```bash
 # Validar sintaxis y configuración sin iniciar los servidores (--check-config)
 cargo run --bin ilp_mcp_sidecar --features mcp -- --check-config --policy policies/default_msac.conf
-cargo run --bin ilp_mcp_gateway --features mcp -- --check-config --psk 00112233445566778899aabbccddeeff
+ILP_PSK_HEX="00112233445566778899aabbccddeeff" cargo run --bin ilp_mcp_gateway --features mcp -- --check-config
 ```
 
 #### 4. Guía de Despliegue en 3 Terminales (Quickstart)
@@ -253,6 +259,9 @@ cargo run --bin ilp_mcp_gateway --features mcp -- --check-config --psk 001122334
 Sigue estos pasos para desplegar la arquitectura completa en terminales independientes:
 
 ```bash
+# Exportar la clave pre-compartida segura en el entorno de los daemons
+export ILP_PSK_HEX="00112233445566778899aabbccddeeff"
+
 # ------------------------------------------------------------------------------
 # TERMINAL 1: Servidor de Herramientas MCP Backend (ejemplo de escucha en 8080)
 # ------------------------------------------------------------------------------
@@ -264,8 +273,7 @@ python3 -m http.server 8080   # o tu servidor MCP real: npx -y @modelcontextprot
 # ------------------------------------------------------------------------------
 cargo run --bin ilp_mcp_gateway --features mcp -- \
     --listen 127.0.0.1:9002 \
-    --backend 127.0.0.1:8080 \
-    --psk 00112233445566778899aabbccddeeff
+    --backend 127.0.0.1:8080
 
 # ------------------------------------------------------------------------------
 # TERMINAL 3: ILP MCP Sidecar Daemon (recibe JSON-RPC en 9001 -> reenvía a 9002)
@@ -274,7 +282,6 @@ cargo run --bin ilp_mcp_sidecar --features mcp -- \
     --listen 127.0.0.1:9001 \
     --gateway 127.0.0.1:9002 \
     --policy policies/default_msac.conf \
-    --psk 00112233445566778899aabbccddeeff \
     --initial-taint MedicalPii,Credentials
 
 # ------------------------------------------------------------------------------

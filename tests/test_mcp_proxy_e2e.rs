@@ -527,6 +527,11 @@ fn test_mcp_proxy_dynamic_auto_taint_ingress() {
     )
     .expect("Start sidecar");
 
+    // Cliente abre conexión MCP persistente con el Sidecar (sesión de agente)
+    let stream = TcpStream::connect(&sidecar.addr).expect("Connect to sidecar");
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = stream;
+
     // 1. PETICIÓN 1: Consulta médica legítima.
     let req1 = json!({
         "jsonrpc": "2.0",
@@ -537,19 +542,17 @@ fn test_mcp_proxy_dynamic_auto_taint_ingress() {
             "arguments": { "patient_id": 1042 }
         }
     });
-    let resp1 = send_mcp_request(&sidecar.addr, &req1);
+    let mut line1 = req1.to_string();
+    line1.push('\n');
+    writer.write_all(line1.as_bytes()).unwrap();
+    writer.flush().unwrap();
+
+    let mut resp_str1 = String::new();
+    reader.read_line(&mut resp_str1).unwrap();
+    let resp1: serde_json::Value = serde_json::from_str(&resp_str1).unwrap();
     assert!(resp1.get("result").is_some());
 
-    // Verificar que el Sidecar detectó dinámicamente datos médicos y se auto-manchó con MedicalPii
-    {
-        let ctx = taint_context.lock().unwrap();
-        assert!(
-            ctx.has_taint(TaintTag::MEDICAL_PII),
-            "El proceso debe haberse auto-manchado dinámicamente con MEDICAL_PII"
-        );
-    }
-
-    // 2. PETICIÓN 2: Intento posterior del agente de emitir tráfico externo.
+    // 2. PETICIÓN 2: Intento posterior en la misma sesión del agente de emitir tráfico externo.
     let req2 = json!({
         "jsonrpc": "2.0",
         "id": "egress-after-taint",
@@ -559,12 +562,20 @@ fn test_mcp_proxy_dynamic_auto_taint_ingress() {
             "arguments": { "data": "sync" }
         }
     });
-    let resp2 = send_mcp_request(&sidecar.addr, &req2);
+    let mut line2 = req2.to_string();
+    line2.push('\n');
+    writer.write_all(line2.as_bytes()).unwrap();
+    writer.flush().unwrap();
 
-    // Debe ser bloqueado AUTOMÁTICAMENTE por Paso 1 MSAC (Taint Drop)
+    let mut resp_str2 = String::new();
+    reader.read_line(&mut resp_str2).unwrap();
+    let resp2: serde_json::Value = serde_json::from_str(&resp_str2).unwrap();
+
+    // Debe ser bloqueado AUTOMÁTICAMENTE por Paso 1 MSAC (Taint Drop) debido al auto-manchado dinámico
     assert!(
         resp2.get("error").is_some(),
-        "La petición subsiguiente debió ser bloqueada por Taint"
+        "La petición subsiguiente debió ser bloqueada por Taint en la sesión del cliente: {:?}",
+        resp2
     );
     assert_eq!(resp2["error"]["verdict"], "Drop");
     assert_eq!(resp2["error"]["code"], -32000);
@@ -699,4 +710,310 @@ fn test_mcp_proxy_psk_mac_authentication_and_tamper_rejection() {
         .as_str()
         .unwrap()
         .contains("Frame MAC authentication failed"));
+}
+
+#[test]
+fn test_mcp_proxy_verify_then_parse_rejection() {
+    let mock_server = MockToolServer::spawn();
+    let psk = [0x55u8; 16];
+    let config = SidecarConfig {
+        psk: Some(psk),
+        ..Default::default()
+    };
+    let gateway = McpGatewayServer::start("127.0.0.1:0", mock_server.addr.clone(), config)
+        .expect("Start gateway");
+
+    // Enviar paquete directamente al gateway con payload no-JSON y firma MAC inválida
+    let gateway_stream = TcpStream::connect(&gateway.addr).expect("Connect directly to gateway");
+    let mut ilp_stream = ilp_core::transport::IlpStream::new(gateway_stream);
+
+    // Payload completamente inválido que rompería serde_json si fuera deserializado primero
+    let corrupted_payload = b"MALFORMED_NON_JSON_CORRUPTED_DATA_12345!@#$%^&*()";
+    let forged_packet = ilp_core::ipdu::IpduPacket::try_new(
+        ilp_core::ipdu::IpduHeader::new(
+            ilp_core::ipdu::Performative::ProposeIntent,
+            1,
+            ilp_core::ipdu::CognitivePolicyFlags::EMPTY,
+            0x1234_5678,
+            0x9999_aaaa,
+            1000,
+            5000,
+            0xDEAD_CAFE, // MAC inválido
+        )
+        .unwrap(),
+        corrupted_payload.to_vec(),
+    )
+    .unwrap();
+
+    ilp_stream.send_packet(&forged_packet).expect("Send packet");
+    let resp_pkt = ilp_stream.recv_packet().expect("Receive rejection packet");
+
+    // Invariante Verify-Then-Parse: La verificación de MAC debe fallar primero (-32001)
+    // El servidor no debe crashear ni emitir Parse error (-32700)
+    let resp_json: serde_json::Value = serde_json::from_slice(resp_pkt.payload()).unwrap();
+    assert_eq!(
+        resp_json["error"]["code"], -32001,
+        "La validación MAC debe preceder al parsing del payload (código -32001, no parse error)"
+    );
+    assert!(resp_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Frame MAC authentication failed"));
+}
+
+#[test]
+fn test_mcp_proxy_anti_replay_defense() {
+    let mock_server = MockToolServer::spawn();
+    let psk = [0x77u8; 16];
+    let config = SidecarConfig {
+        psk: Some(psk),
+        ..Default::default()
+    };
+    let gateway = McpGatewayServer::start("127.0.0.1:0", mock_server.addr.clone(), config)
+        .expect("Start gateway");
+
+    let gateway_stream = TcpStream::connect(&gateway.addr).expect("Connect directly to gateway");
+    let mut ilp_stream = ilp_core::transport::IlpStream::new(gateway_stream);
+
+    let session_uuid = 0xbeef_cafe_1234_5678u64;
+    let valid_req = json!({
+        "jsonrpc": "2.0",
+        "id": "replay-test-01",
+        "method": "tools/call",
+        "params": {
+            "name": "echo_service",
+            "arguments": { "msg": "anti-replay" }
+        }
+    });
+    let req_bytes = serde_json::to_vec(&valid_req).unwrap();
+
+    let mut header = ilp_core::ipdu::IpduHeader::new(
+        ilp_core::ipdu::Performative::ProposeIntent,
+        1,
+        ilp_core::ipdu::CognitivePolicyFlags::EMPTY,
+        0x1111_2222,
+        session_uuid,
+        1000,
+        5000,
+        0,
+    )
+    .unwrap();
+    let mac = ilp_core::ipdu::auth::compute_frame_mac(&header, &req_bytes, &psk);
+    header.user_rule_sig_hash = mac;
+
+    let valid_packet = ilp_core::ipdu::IpduPacket::try_new(header, req_bytes).unwrap();
+
+    // 1. Envío inicial legítimo -> Debe ser procesado exitosamente
+    ilp_stream
+        .send_packet(&valid_packet)
+        .expect("Send initial packet");
+    let resp1 = ilp_stream.recv_packet().expect("Receive first response");
+    let resp1_json: serde_json::Value = serde_json::from_slice(resp1.payload()).unwrap();
+    assert!(
+        resp1_json.get("result").is_some(),
+        "Primera transmisión debe ser procesada: {:?}",
+        resp1_json
+    );
+
+    // 2. Replay idéntico con el mismo session_uuid -> Debe ser rechazado por ReplayGuard (-32003)
+    ilp_stream
+        .send_packet(&valid_packet)
+        .expect("Send duplicate replayed packet");
+    let resp2 = ilp_stream.recv_packet().expect("Receive replay response");
+    let resp2_json: serde_json::Value = serde_json::from_slice(resp2.payload()).unwrap();
+    assert_eq!(
+        resp2_json["error"]["code"], -32003,
+        "Retransmisión con UUID idéntico debe ser rechazada con -32003: {:?}",
+        resp2_json
+    );
+    assert!(resp2_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Replay attack detected"));
+}
+
+#[test]
+fn test_mcp_proxy_multi_client_taint_isolation() {
+    let mock_server = MockToolServer::spawn();
+    let gateway = McpGatewayServer::start(
+        "127.0.0.1:0",
+        mock_server.addr.clone(),
+        SidecarConfig::default(),
+    )
+    .expect("Start gateway");
+
+    // Política que bloquea egress si el proceso está manchado con MedicalPii
+    let policy_conf = r#"
+user_did = did:key:z6MkuMultiClientTaintTest
+max_budget_cap = 50000
+max_autonomy_tier = 2
+deny_external_egress_if_tainted = true
+"#;
+    let policy = UserGovernancePolicy::from_conf_str(policy_conf).expect("Parse policy");
+    let firewall = CognitiveFirewall::new(policy);
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
+        8888,
+        "TaintIsolatedWorker",
+        true,
+    )));
+
+    // 1. Sidecar con trust_client_taint_claims = true
+    let sidecar_trusted = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall.clone(),
+        taint_context.clone(),
+        SidecarConfig {
+            trust_client_taint_claims: true,
+            ..Default::default()
+        },
+    )
+    .expect("Start trusted sidecar");
+
+    // Cliente 1 abre una conexión persistente
+    let stream1 = TcpStream::connect(&sidecar_trusted.addr).expect("Client 1 connect");
+    let mut reader1 = BufReader::new(stream1.try_clone().unwrap());
+    let mut writer1 = stream1;
+
+    // Cliente 1 envía claim medical_pii en su primera petición
+    let c1_req1 = json!({
+        "jsonrpc": "2.0",
+        "id": "c1-01",
+        "method": "tools/call",
+        "params": {
+            "name": "echo_service",
+            "_ilp_taint_claim": "medical_pii",
+            "arguments": { "data": "initial" }
+        }
+    });
+    let mut line1 = c1_req1.to_string();
+    line1.push('\n');
+    writer1.write_all(line1.as_bytes()).unwrap();
+    writer1.flush().unwrap();
+
+    let mut resp_str1 = String::new();
+    reader1.read_line(&mut resp_str1).unwrap();
+    let r1: serde_json::Value = serde_json::from_str(&resp_str1).unwrap();
+    assert!(
+        r1.get("error").is_some(),
+        "Cliente 1 debe ser bloqueado inmediatamente por MSAC al auto-declarar claim sensible: {:?}",
+        r1
+    );
+    assert_eq!(r1["error"]["verdict"], "Drop");
+
+    // Cliente 1 intenta segunda petición en la misma conexión -> BLOQUEADA por firewall
+    let c1_req2 = json!({
+        "jsonrpc": "2.0",
+        "id": "c1-02",
+        "method": "tools/call",
+        "params": {
+            "name": "echo_service",
+            "arguments": { "data": "blocked_attempt" }
+        }
+    });
+    let mut line2 = c1_req2.to_string();
+    line2.push('\n');
+    writer1.write_all(line2.as_bytes()).unwrap();
+    writer1.flush().unwrap();
+
+    let mut resp_str2 = String::new();
+    reader1.read_line(&mut resp_str2).unwrap();
+    let r2: serde_json::Value = serde_json::from_str(&resp_str2).unwrap();
+    assert!(
+        r2.get("error").is_some(),
+        "Cliente 1 debe estar manchado y ser bloqueado: {:?}",
+        r2
+    );
+    assert_eq!(r2["error"]["verdict"], "Drop");
+
+    // Cliente 2 abre una conexión NUEVA e independiente
+    let stream2 = TcpStream::connect(&sidecar_trusted.addr).expect("Client 2 connect");
+    let mut reader2 = BufReader::new(stream2.try_clone().unwrap());
+    let mut writer2 = stream2;
+
+    // Cliente 2 envía una petición limpia (sin claim) -> DEBE TENER ÉXITO (aislamiento)
+    let c2_req = json!({
+        "jsonrpc": "2.0",
+        "id": "c2-01",
+        "method": "tools/call",
+        "params": {
+            "name": "echo_service",
+            "arguments": { "data": "clean_client2" }
+        }
+    });
+    let mut line_c2 = c2_req.to_string();
+    line_c2.push('\n');
+    writer2.write_all(line_c2.as_bytes()).unwrap();
+    writer2.flush().unwrap();
+
+    let mut resp_str_c2 = String::new();
+    reader2.read_line(&mut resp_str_c2).unwrap();
+    let r_c2: serde_json::Value = serde_json::from_str(&resp_str_c2).unwrap();
+    assert!(
+        r_c2.get("result").is_some(),
+        "Cliente 2 NO debe ser contaminado por el tinte del Cliente 1: {:?}",
+        r_c2
+    );
+
+    // 2. Sidecar con trust_client_taint_claims = false (Default en producción)
+    let sidecar_untrusted = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        taint_context,
+        SidecarConfig {
+            trust_client_taint_claims: false,
+            ..Default::default()
+        },
+    )
+    .expect("Start untrusted sidecar");
+
+    let stream3 = TcpStream::connect(&sidecar_untrusted.addr).expect("Client 3 connect");
+    let mut reader3 = BufReader::new(stream3.try_clone().unwrap());
+    let mut writer3 = stream3;
+
+    // Intenta auto-mancharse con claim no confiable
+    let c3_req1 = json!({
+        "jsonrpc": "2.0",
+        "id": "c3-01",
+        "method": "tools/call",
+        "params": {
+            "name": "echo_service",
+            "_ilp_taint_claim": "medical_pii",
+            "arguments": { "data": "untrusted_claim" }
+        }
+    });
+    let mut line_c3_1 = c3_req1.to_string();
+    line_c3_1.push('\n');
+    writer3.write_all(line_c3_1.as_bytes()).unwrap();
+    writer3.flush().unwrap();
+
+    let mut resp_str_c3_1 = String::new();
+    reader3.read_line(&mut resp_str_c3_1).unwrap();
+    let r3_1: serde_json::Value = serde_json::from_str(&resp_str_c3_1).unwrap();
+    assert!(r3_1.get("result").is_some());
+
+    // Segunda petición -> DEBE TENER ÉXITO porque el claim del cliente fue ignorado
+    let c3_req2 = json!({
+        "jsonrpc": "2.0",
+        "id": "c3-02",
+        "method": "tools/call",
+        "params": {
+            "name": "echo_service",
+            "arguments": { "data": "untrusted_claim_check" }
+        }
+    });
+    let mut line_c3_2 = c3_req2.to_string();
+    line_c3_2.push('\n');
+    writer3.write_all(line_c3_2.as_bytes()).unwrap();
+    writer3.flush().unwrap();
+
+    let mut resp_str_c3_2 = String::new();
+    reader3.read_line(&mut resp_str_c3_2).unwrap();
+    let r3_2: serde_json::Value = serde_json::from_str(&resp_str_c3_2).unwrap();
+    assert!(
+        r3_2.get("result").is_some(),
+        "Claim de cliente no confiable no debe aplicar tinte cuando trust_client_taint_claims = false: {:?}",
+        r3_2
+    );
 }

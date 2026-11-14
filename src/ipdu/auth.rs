@@ -137,7 +137,7 @@ pub fn compute_frame_mac(header: &IpduHeader, payload: &[u8], secret_key: &[u8; 
     hasher.finish()
 }
 
-/// Verifica el MAC de integridad de una trama I-PDU en tiempo constante.
+/// Verifica el MAC de integridad de una trama I-PDU en tiempo constante mitigado con barrera de compilador `black_box`.
 pub fn verify_frame_mac(
     header: &IpduHeader,
     payload: &[u8],
@@ -145,9 +145,10 @@ pub fn verify_frame_mac(
     expected_mac: u64,
 ) -> bool {
     let computed = compute_frame_mac(header, payload, secret_key);
-    // Comparación en tiempo constante para mitigar timing attacks
-    let diff = computed ^ expected_mac;
-    diff == 0
+    // Comparación XOR mitigada con barrera de compilador black_box para prevenir optimizaciones de ramificación
+    let a = std::hint::black_box(computed);
+    let b = std::hint::black_box(expected_mac);
+    std::hint::black_box(a ^ b) == 0
 }
 
 #[cfg(test)]
