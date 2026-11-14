@@ -95,8 +95,8 @@ impl SipHash24 {
     /// Finaliza y produce el valor MAC de 64 bits.
     pub fn finish(mut self) -> u64 {
         let mut b: u64 = ((self.total_len & 0xff) as u64) << 56;
-        for i in 0..self.buf_len {
-            b |= (self.buffer[i] as u64) << (8 * i);
+        for (i, &byte) in self.buffer.iter().take(self.buf_len).enumerate() {
+            b |= (byte as u64) << (8 * i);
         }
 
         self.process_word(b);

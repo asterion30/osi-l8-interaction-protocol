@@ -135,6 +135,7 @@ pub struct ConnectionPermit {
 #[cfg(feature = "mcp")]
 impl ConnectionPermit {
     /// Intenta adquirir atómicamente un permiso de conexión mediante CAS (Compare-And-Swap).
+    #[allow(deprecated)]
     pub fn try_acquire(counter: Arc<AtomicUsize>, max: usize) -> Option<Self> {
         let res = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |curr| {
             if curr < max {
