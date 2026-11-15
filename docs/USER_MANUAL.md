@@ -53,13 +53,16 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 ### Compilación y Pruebas
 ```bash
 # Compilar la biblioteca y binarios
-cargo build
+cargo build --locked
 
-# Ejecutar la suite completa de tests unitarios y de integración (65 tests)
-cargo test --all-targets --all-features
+# Ejecutar la suite completa de tests unitarios y de integración (70 tests)
+cargo test --locked --all-targets --all-features
 
-# Comprobar análisis estático sin advertencias
-cargo clippy --all-targets --all-features -- -D warnings
+# Auditar y verificar el conteo formal de pruebas
+./scripts/verify_test_count.sh
+
+# Comprobar análisis estático sin advertencias (MSRV 1.70.0 y Stable)
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 ### Ejecutar la Demostración de Red en Vivo (Multi-Agente)
@@ -331,3 +334,54 @@ cargo run --release --example benchmark_latency
 | `EPERM_SANDBOX_REQUIRED` | Aislamiento Obligatorio | Se requiere el flag `REQUIRE_SANDBOXED_INFERENCE` y el agente no lo proporcionó. |
 | `EPERM_PROMPT_INJECTION` | Inyección Adversaria | El payload contiene patrones de jailbreak, evasión o suplantación de identidad instruccional. |
 | `EPERM_SEMANTIC_EXFILTRATION` | Fuga de Datos en Carga Útil | El payload contiene números de tarjeta de crédito, números de seguridad social o secretos API. |
+
+---
+
+## 6. Métodos MCP Soportados y Correspondencia con Performativas I-PDU
+
+El puente `McpBridge` traduce y encapsula el subconjunto oficial de métodos JSON-RPC del Model Context Protocol (MCP 2024-11-05) mapeándolos a performativas formales de Capa 8:
+
+| Método MCP JSON-RPC | Performativa I-PDU Capa 8 | Semántica Operativa y Control Cognitivo |
+| :--- | :--- | :--- |
+| `initialize` | `Performative::DiscoverSkill` | Negociación inicial de versión del protocolo y capacidades. |
+| `notifications/initialized` | `Performative::DiscoverSkill` | Confirmación de cliente agéntico listo para procesar intenciones. |
+| `ping` | `Performative::DiscoverSkill` | Heartbeat de disponibilidad de conexión y baja sobrecarga. |
+| `tools/list` | `Performative::DiscoverSkill` | Inspección del catálogo de herramientas autorizadas según tier. |
+| `prompts/list` | `Performative::DiscoverSkill` | Descubrimiento de plantillas de prompts de inferencia disponibles. |
+| `resources/list` | `Performative::DiscoverSkill` | Enumeración de URIs de recursos y fuentes expuestas. |
+| `tools/call` | `Performative::ProposeIntent` | Invocación de herramienta auditada por MSAC, DLP y Taint Tracking. |
+| `resources/read` | `Performative::ProposeIntent` | Lectura de recurso con derivación de hash de URI y control de tinte. |
+| `prompts/get` | `Performative::ProposeIntent` | Obtención parametrizada de prompts con validación de inyección instruccional. |
+
+---
+
+## 7. Checklist de Operaciones de Producción y Hardening
+
+Para desplegar la arquitectura de Capa 8 en entornos de misión crítica, seguir este checklist riguroso:
+
+1. **Gestión y Almacenamiento Seguro de Claves PSK**:
+   - Asignar permisos estrictos de lectura exclusiva: `chmod 0600` o `chmod 0400` al archivo de clave.
+   - Prohibir terminantemente el uso de enlaces simbólicos (`symlink`) y enlaces duros (`hardlink`) para prevenir ataques TOCTOU y accesos compartidos fuera del control del daemon.
+   - El daemon valida atómicamente en Linux/POSIX mediante `MetadataExt` que `symlink_metadata().dev() == file.metadata().dev()`, `ino() == ino()` y `nlink() == 1`.
+
+2. **Rotación de Claves sin Tiempo de Inactividad (Zero-Downtime Rotation)**:
+   - Desplegar una instancia secundaria de Gateway en un puerto paralelo con la nueva clave PSK.
+   - Actualizar gradualmente los Sidecars apuntando a la nueva instancia.
+   - Apagar ordenadamente la instancia de Gateway anterior mediante `McpGatewayServer::shutdown()` asegurando que se drenen todas las transacciones en vuelo.
+
+3. **Apagado Ordenado y Drenaje de Conexiones (Graceful Shutdown)**:
+   - Configurar `drain_timeout` en `SidecarConfig` y `GatewayConfig` (valor por defecto recomendado: `2000 ms`).
+   - Al recibir señales `SIGINT` o `SIGTERM`, invocar `server.shutdown()` para detener la aceptación de nuevos clientes y esperar a que las conexiones activas completen su intercambio I-PDU antes de finalizar el proceso.
+
+4. **Aislamiento de Red y Perímetro Restringido**:
+   - Por defecto, los daemons se niegan a escuchar en interfaces no-loopback (`0.0.0.0`) a menos que se especifique explícitamente `--allow-non-loopback` y una clave `--psk-file` válida.
+   - Para despliegues inter-servidor, tunelizar el tráfico I-PDU sobre mTLS o túneles de red WireGuard dedicados y restringir el puerto mediante `iptables` / `nftables` a nivel de namespace de red (`netns`).
+
+5. **Protección Anti-Replay y Política Fail-Closed bajo Carga**:
+   - Dimensionar la ventana temporal de `ReplayGuard` (`window_ttl = 60s`, `max_entries = 4096`).
+   - Bajo ráfagas extremas que saturen la tabla de memoria, el Gateway aplica política *Fail-Closed*: rechaza solicitudes adicionales con error `-32000` en lugar de expulsar entradas vigentes, preservando la garantía absoluta de no-repetición.
+
+6. **Monitoreo y Auditoría de Tinte en Tiempo Real**:
+   - Integrar un colector de logs que consuma periódicamente el ring buffer `CognitiveFirewall::audit_log()`.
+   - Alertar inmediatamente ante eventos con `FilterDecision::Drop`, especialmente códigos `EPERM_COGNITIVE_POLICY` (intento de exfiltración de PII o credenciales) y `EPERM_PROMPT_INJECTION`.
+

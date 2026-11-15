@@ -196,7 +196,10 @@ pub fn load_psk_from_file_secure(path: &str) -> Result<[u8; 16], String> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if sym_meta.dev() != meta.dev() || sym_meta.ino() != meta.ino() || meta.nlink() > 1 {
+            return Err("Security error: TOCTOU race or hardlink detected on PSK file".to_string());
+        }
         let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(format!(
@@ -216,15 +219,76 @@ pub fn load_psk_from_file_secure(path: &str) -> Result<[u8; 16], String> {
     parse_hex_psk(&content)
 }
 
-/// Verifica el MAC de integridad de una trama I-PDU comparando byte a byte en tiempo constante
-/// mitigado con barrera de optimización del compilador (`black_box`).
+/// Genera un identificador de sesión pseudoaleatorio criptográfico (CSPRNG) de 64 bits sin dependencias externas (`std` puro).
 ///
-/// **Alcance Criptográfico del Tag de 64 bits**:
-/// SipHash-2-4 produce un tag de autenticación de 64 bits. Para tráfico de red a alta velocidad,
-/// una colisión accidental o de falsificación ciega tiene una probabilidad de 2^-64 por intento,
-/// lo cual es suficiente para integridad de trama punto a punto. La comparación se realiza sobre
-/// los 8 bytes independientes acumulando un XOR en tiempo constante para mitigar ataques de canal
-/// lateral (timing side-channels).
+/// **Estrategia de Entropía**:
+/// - En sistemas Unix (`#[cfg(unix)]`), lee 8 bytes directamente del dispositivo de entropía del kernel `/dev/urandom`.
+/// - Si `/dev/urandom` no estuviera disponible o en entornos no-Unix, utiliza como fallback la semilla de dos
+///   instancias de `std::collections::hash_map::RandomState` (las cuales el runtime de Rust inicializa mediante
+///   `getrandom` del sistema operativo), combinadas con el PID del proceso (`std::process::id()`), la marca de tiempo
+///   en nanosegundos (`SystemTime::now()`) y un contador atómico local, procesadas mediante una ronda de `SipHash24`.
+///
+/// **Invariante**: El valor retornado garantiza ser estrictamente distinto de cero (si resulta 0, se mapea a 1).
+pub fn generate_cryptographic_session_uuid() -> u64 {
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            use std::io::Read;
+            let mut buf = [0u8; 8];
+            if f.read_exact(&mut buf).is_ok() {
+                let val = u64::from_le_bytes(buf);
+                if val != 0 {
+                    return val;
+                }
+            }
+        }
+    }
+
+    fallback_session_uuid()
+}
+
+fn fallback_session_uuid() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+
+    static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let counter = FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    let s1 = RandomState::new().build_hasher().finish();
+    let s2 = RandomState::new().build_hasher().finish();
+
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&s1.to_le_bytes());
+    key[8..].copy_from_slice(&s2.to_le_bytes());
+
+    let mut hasher = SipHash24::new_with_key(&key);
+    hasher.update(&pid.to_le_bytes());
+    hasher.update(&now.to_le_bytes());
+    hasher.update(&counter.to_le_bytes());
+    let val = hasher.finish();
+    if val == 0 {
+        1
+    } else {
+        val
+    }
+}
+
+/// Verifica el MAC de integridad de una trama I-PDU comparando byte a byte mediante un acumulador
+/// XOR de longitud fija con barrera `black_box` del compilador.
+///
+/// **Garantía y Alcance Criptográfico**:
+/// - Comparación: Fixed-length 8-byte XOR accumulator with compiler black_box barrier
+///   (mitigates early-exit branch timing; not a formally verified constant-time primitive across all LLVM backends).
+/// - SipHash-2-4 produce un tag de autenticación de 64 bits. Para tráfico de red a alta velocidad,
+///   una colisión accidental o de falsificación ciega tiene una probabilidad de 2^-64 por intento,
+///   suficiente para integridad y autenticación de trama punto a punto.
 pub fn verify_frame_mac(
     header: &IpduHeader,
     payload: &[u8],
@@ -301,5 +365,20 @@ mod tests {
         let mut hasher15 = SipHash24::new_with_key(&key);
         hasher15.update(&in15);
         assert_eq!(hasher15.finish(), 0xa129ca6149be45e5);
+    }
+
+    #[test]
+    fn test_generate_cryptographic_session_uuid_entropy_and_non_zero() {
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        for _ in 0..1000 {
+            let uuid = generate_cryptographic_session_uuid();
+            assert_ne!(uuid, 0, "session_uuid jamás debe ser cero");
+            assert!(
+                seen.insert(uuid),
+                "Colisión inesperada detectada en 1000 UUIDs criptográficos generados"
+            );
+        }
     }
 }

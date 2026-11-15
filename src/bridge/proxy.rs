@@ -122,6 +122,8 @@ pub struct SidecarConfig {
     pub psk: Option<[u8; 16]>,
     /// Si es false (default en producción), ignora claims de tinte no autenticados enviados por el cliente.
     pub trust_client_taint_claims: bool,
+    /// Tiempo máximo de espera para drenar conexiones activas durante un apagado graceful. Default: 2.000 ms.
+    pub drain_timeout: Duration,
 }
 
 #[cfg(feature = "mcp")]
@@ -136,6 +138,7 @@ impl Default for SidecarConfig {
             deadline_ttl_ms: 5_000,
             psk: None,
             trust_client_taint_claims: false,
+            drain_timeout: Duration::from_millis(2_000),
         }
     }
 }
@@ -426,6 +429,7 @@ pub struct McpSidecarServer {
     pub addr: String,
     pub active_connections: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
+    pub drain_timeout: Duration,
 }
 
 #[cfg(feature = "mcp")]
@@ -442,6 +446,7 @@ impl McpSidecarServer {
         let addr = listener.local_addr()?.to_string();
         listener.set_nonblocking(true)?;
 
+        let drain_timeout = config.drain_timeout;
         let shutdown = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicUsize::new(0));
         let correlation = Arc::new(McpSessionCorrelationTable::new());
@@ -756,14 +761,28 @@ impl McpSidecarServer {
             addr,
             active_connections,
             shutdown,
+            drain_timeout,
         })
+    }
+
+    /// Detiene la aceptación de conexiones y drena las conexiones activas de forma ordenada
+    /// hasta que `active_connections == 0` o expire `drain_timeout`.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        while self.active_connections.load(Ordering::SeqCst) > 0 {
+            if start.elapsed() >= self.drain_timeout {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
 #[cfg(feature = "mcp")]
 impl Drop for McpSidecarServer {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown();
     }
 }
 
@@ -774,6 +793,7 @@ pub struct McpGatewayServer {
     pub accepted_connections: Arc<AtomicUsize>,
     pub active_connections: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
+    pub drain_timeout: Duration,
 }
 
 #[cfg(feature = "mcp")]
@@ -788,6 +808,7 @@ impl McpGatewayServer {
         let addr = listener.local_addr()?.to_string();
         listener.set_nonblocking(true)?;
 
+        let drain_timeout = config.drain_timeout;
         let shutdown = Arc::new(AtomicBool::new(false));
         let accepted_connections = Arc::new(AtomicUsize::new(0));
         let active_connections = Arc::new(AtomicUsize::new(0));
@@ -1029,13 +1050,27 @@ impl McpGatewayServer {
             accepted_connections,
             active_connections,
             shutdown,
+            drain_timeout,
         })
+    }
+
+    /// Detiene la aceptación de conexiones y drena las conexiones activas de forma ordenada
+    /// hasta que `active_connections == 0` o expire `drain_timeout`.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        while self.active_connections.load(Ordering::SeqCst) > 0 {
+            if start.elapsed() >= self.drain_timeout {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
 #[cfg(feature = "mcp")]
 impl Drop for McpGatewayServer {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown();
     }
 }

@@ -331,3 +331,60 @@ fn test_cli_binaries_symlink_psk_rejected() {
 
     let _ = std::fs::remove_file(&target_path);
 }
+
+#[test]
+fn test_cli_binaries_hardlink_psk_rejected() {
+    let sidecar_bin = env!("CARGO_BIN_EXE_ilp_mcp_sidecar");
+    let gateway_bin = env!("CARGO_BIN_EXE_ilp_mcp_gateway");
+
+    let tmp_dir = std::env::temp_dir();
+    let target_path = tmp_dir.join(format!(
+        "test_ilp_real_hardlink_psk_{}.key",
+        std::process::id()
+    ));
+    let hardlink_path = tmp_dir.join(format!("test_ilp_hardlink_psk_{}.key", std::process::id()));
+
+    std::fs::write(&target_path, "00112233445566778899aabbccddeeff\n")
+        .expect("Write real PSK file");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o600))
+            .expect("Set 0600 permissions");
+        let _ = std::fs::remove_file(&hardlink_path);
+        std::fs::hard_link(&target_path, &hardlink_path).expect("Create PSK hard link");
+
+        // 1. Sidecar con hardlink (nlink == 2) debe fallar con código no-cero
+        let sc_status = Command::new(sidecar_bin)
+            .args([
+                "--check-config",
+                "--psk-file",
+                hardlink_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("Execute sidecar with hardlink PSK");
+        assert!(
+            !sc_status.success(),
+            "Sidecar DEBE rechazar --psk-file cuando tiene múltiples enlaces duros (nlink > 1)"
+        );
+
+        // 2. Gateway con hardlink (nlink == 2) debe fallar con código no-cero
+        let gw_status = Command::new(gateway_bin)
+            .args([
+                "--check-config",
+                "--psk-file",
+                hardlink_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("Execute gateway with hardlink PSK");
+        assert!(
+            !gw_status.success(),
+            "Gateway DEBE rechazar --psk-file cuando tiene múltiples enlaces duros (nlink > 1)"
+        );
+
+        let _ = std::fs::remove_file(&hardlink_path);
+    }
+
+    let _ = std::fs::remove_file(&target_path);
+}

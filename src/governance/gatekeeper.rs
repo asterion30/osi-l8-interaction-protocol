@@ -36,10 +36,7 @@ impl fmt::Display for GatekeeperThreat {
 #[derive(Debug, Clone, Default)]
 pub struct HeuristicGatekeeper;
 
-/// Alias para mantener retrocompatibilidad con integraciones previas.
-#[deprecated(
-    note = "Usa HeuristicGatekeeper para reflejar con precisión la naturaleza del escaneo heurístico."
-)]
+/// Alias para retrocompatibilidad con integraciones previas.
 pub type SlmGatekeeper = HeuristicGatekeeper;
 
 impl HeuristicGatekeeper {

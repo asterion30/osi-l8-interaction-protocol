@@ -24,8 +24,6 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "mcp")]
 use std::collections::HashMap;
 #[cfg(feature = "mcp")]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "mcp")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
@@ -156,12 +154,13 @@ impl McpRpcRequest {
         }
     }
 
-    /// Retorna el nombre de la herramienta si la solicitud es de tipo `tools/call`.
+    /// Retorna el nombre de la herramienta o identificador de recurso si la solicitud lo expone.
     pub fn tool_name(&self) -> Option<&str> {
-        if self.method == "tools/call" {
-            self.params.get("name").and_then(|v| v.as_str())
-        } else {
-            None
+        match self.method.as_str() {
+            "tools/call" => self.params.get("name").and_then(|v| v.as_str()),
+            "resources/read" => self.params.get("uri").and_then(|v| v.as_str()),
+            "prompts/get" => self.params.get("name").and_then(|v| v.as_str()),
+            _ => None,
         }
     }
 }
@@ -187,7 +186,6 @@ pub struct PendingSession {
 #[derive(Debug, Clone)]
 pub struct McpSessionCorrelationTable {
     sessions: Arc<Mutex<HashMap<(u64, String), PendingSession>>>,
-    next_uuid: Arc<AtomicU64>,
 }
 
 #[cfg(feature = "mcp")]
@@ -203,7 +201,6 @@ impl McpSessionCorrelationTable {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            next_uuid: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -227,6 +224,9 @@ impl McpSessionCorrelationTable {
     /// Registra una nueva sesión pendiente asociada al cliente y su ID JSON-RPC.
     /// Ejecuta `purge_expired` antes de insertar y rechaza si se supera `MAX_PENDING_SESSIONS`
     /// o si ya existe una petición idéntica activa en vuelo.
+    ///
+    /// Genera un `session_uuid` criptográfico mediante CSPRNG (entropía del SO + SipHash24),
+    /// garantizando que el reinicio de sidecars o sidecars concurrentes no colisionen.
     pub fn register_session(
         &self,
         client_conn_id: u64,
@@ -253,7 +253,11 @@ impl McpSessionCorrelationTable {
             return Err(McpBridgeError::CapacityExceeded);
         }
 
-        let session_uuid = self.next_uuid.fetch_add(1, Ordering::SeqCst);
+        let mut session_uuid = crate::ipdu::auth::generate_cryptographic_session_uuid();
+        while map.values().any(|s| s.session_uuid == session_uuid) {
+            session_uuid = crate::ipdu::auth::generate_cryptographic_session_uuid();
+        }
+
         map.insert(
             key,
             PendingSession {
@@ -304,7 +308,7 @@ impl McpBridge {
     /// Deriva el `skill_namespace_hash` determinista a partir del método o nombre de herramienta.
     pub fn derive_skill_hash(method: &str, tool_name: Option<&str>) -> u64 {
         if let Some(tool) = tool_name {
-            let combined = format!("tools/call:{}", tool);
+            let combined = format!("{}:{}", method, tool);
             fnv1a_64(combined.as_bytes())
         } else {
             fnv1a_64(method.as_bytes())
@@ -330,8 +334,13 @@ impl McpBridge {
         deadline_ttl_ms: u32,
     ) -> Result<IpduPacket, McpBridgeError> {
         let performative = match req.method.as_str() {
-            "tools/call" => Performative::ProposeIntent,
-            "tools/list" | "prompts/list" | "resources/list" => Performative::DiscoverSkill,
+            "tools/call" | "resources/read" | "prompts/get" => Performative::ProposeIntent,
+            "initialize"
+            | "notifications/initialized"
+            | "ping"
+            | "tools/list"
+            | "prompts/list"
+            | "resources/list" => Performative::DiscoverSkill,
             _ => return Err(McpBridgeError::UnsupportedMethod(req.method.clone())),
         };
 

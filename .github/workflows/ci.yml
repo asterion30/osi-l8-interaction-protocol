@@ -26,7 +26,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy Analysis (All Features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test-suite:
     name: Unit & Integration Tests (${{ matrix.toolchain }})
@@ -41,12 +41,16 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
+          components: clippy
+
+      - name: Clippy Analysis (${{ matrix.toolchain }})
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run Core Tests (Zero Dependencies)
-        run: cargo test --verbose
+        run: cargo test --locked --verbose
 
       - name: Run All Tests (Including MCP Feature)
-        run: cargo test --all-features --verbose
+        run: cargo test --locked --all-features --verbose
 
   examples-verification:
     name: Live Demos & Micro-Benchmarks
@@ -58,10 +62,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run Live TCP Agent Proxy Demo
-        run: cargo run --example live_agent_proxy
+        run: cargo run --locked --example live_agent_proxy
 
       - name: Run MCP Governance Shield Demo
-        run: cargo run --example mcp_shield_demo --features mcp
+        run: cargo run --locked --example mcp_shield_demo --features mcp
 
       - name: Run Release Latency Micro-Benchmark
-        run: cargo run --release --example benchmark_latency
+        run: cargo run --locked --release --example benchmark_latency

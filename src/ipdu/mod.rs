@@ -6,7 +6,10 @@ pub mod header;
 pub mod packet;
 pub mod performatives;
 
-pub use auth::{compute_frame_mac, load_psk_from_file_secure, parse_hex_psk, verify_frame_mac};
+pub use auth::{
+    compute_frame_mac, generate_cryptographic_session_uuid, load_psk_from_file_secure,
+    parse_hex_psk, verify_frame_mac,
+};
 pub use flags::CognitivePolicyFlags;
 pub use header::{
     IpduError, IpduHeader, CANONICAL_HEADER_SIZE, COMPACT_256BIT_HEADER_SIZE, ILP_VERSION_1,

@@ -10,7 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Servidor simulado de herramientas MCP (Mock MCP Tool Server) escuchando sobre TCP.
 /// Mantiene un contador atómico de ejecuciones de herramientas para auditar si una
@@ -23,6 +23,10 @@ struct MockToolServer {
 
 impl MockToolServer {
     pub fn spawn() -> Self {
+        Self::spawn_with_delay(Duration::ZERO)
+    }
+
+    pub fn spawn_with_delay(delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Bind mock tool server");
         let addr = listener.local_addr().unwrap().to_string();
         let executions = Arc::new(AtomicUsize::new(0));
@@ -50,23 +54,28 @@ impl MockToolServer {
                                     break;
                                 }
                                 if let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) {
-                                    if req.get("method").and_then(|m| m.as_str())
-                                        == Some("tools/call")
-                                    {
-                                        exec_inner.fetch_add(1, Ordering::SeqCst);
-                                        let resp = json!({
-                                            "jsonrpc": "2.0",
-                                            "id": req.get("id").unwrap_or(&json!(1)),
-                                            "result": {
-                                                "status": "success",
-                                                "echo": req.get("params").and_then(|p| p.get("arguments"))
-                                            }
-                                        });
-                                        let mut resp_str = resp.to_string();
-                                        resp_str.push('\n');
-                                        let _ = writer.write_all(resp_str.as_bytes());
-                                        let _ = writer.flush();
+                                    exec_inner.fetch_add(1, Ordering::SeqCst);
+                                    if delay > Duration::ZERO {
+                                        thread::sleep(delay);
                                     }
+                                    let echo_val = req
+                                        .get("params")
+                                        .and_then(|p| p.get("arguments"))
+                                        .cloned()
+                                        .or_else(|| req.get("params").cloned());
+                                    let resp = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req.get("id").unwrap_or(&json!(1)),
+                                        "result": {
+                                            "status": "success",
+                                            "method": req.get("method"),
+                                            "echo": echo_val
+                                        }
+                                    });
+                                    let mut resp_str = resp.to_string();
+                                    resp_str.push('\n');
+                                    let _ = writer.write_all(resp_str.as_bytes());
+                                    let _ = writer.flush();
                                 }
                                 line.clear();
                             }
@@ -291,7 +300,7 @@ fn test_mcp_proxy_line_length_rejection() {
 
     // Generar una línea JSON que supere los 64 KiB
     let huge_padding = "A".repeat(65 * 1024);
-    let mut stream = TcpStream::connect(&sidecar.addr).expect("Connect to sidecar");
+    let mut stream = TcpStream::connect(sidecar.addr.as_str()).expect("Connect to sidecar");
     let payload = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"pad":"{}"}}}}"#,
         huge_padding
@@ -430,7 +439,7 @@ fn test_mcp_proxy_slowloris_deadline_rejection() {
     )
     .expect("Start sidecar");
 
-    let mut stream = TcpStream::connect(&sidecar.addr).expect("Connect slow client");
+    let mut stream = TcpStream::connect(sidecar.addr.as_str()).expect("Connect slow client");
 
     // Enviar fragmentos goteados lentamente superando el deadline total acumulado sin emitir '\n'
     let _ = stream.write_all(b"{\"json");
@@ -528,7 +537,7 @@ fn test_mcp_proxy_dynamic_auto_taint_ingress() {
     .expect("Start sidecar");
 
     // Cliente abre conexión MCP persistente con el Sidecar (sesión de agente)
-    let stream = TcpStream::connect(&sidecar.addr).expect("Connect to sidecar");
+    let stream = TcpStream::connect(sidecar.addr.as_str()).expect("Connect to sidecar");
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = stream;
 
@@ -724,7 +733,8 @@ fn test_mcp_proxy_verify_then_parse_rejection() {
         .expect("Start gateway");
 
     // Enviar paquete directamente al gateway con payload no-JSON y firma MAC inválida
-    let gateway_stream = TcpStream::connect(&gateway.addr).expect("Connect directly to gateway");
+    let gateway_stream =
+        TcpStream::connect(gateway.addr.as_str()).expect("Connect directly to gateway");
     let mut ilp_stream = ilp_core::transport::IlpStream::new(gateway_stream);
 
     // Payload completamente inválido que rompería serde_json si fuera deserializado primero
@@ -772,7 +782,8 @@ fn test_mcp_proxy_anti_replay_defense() {
     let gateway = McpGatewayServer::start("127.0.0.1:0", mock_server.addr.clone(), config)
         .expect("Start gateway");
 
-    let gateway_stream = TcpStream::connect(&gateway.addr).expect("Connect directly to gateway");
+    let gateway_stream =
+        TcpStream::connect(gateway.addr.as_str()).expect("Connect directly to gateway");
     let mut ilp_stream = ilp_core::transport::IlpStream::new(gateway_stream);
 
     let session_uuid = 0xbeef_cafe_1234_5678u64;
@@ -968,7 +979,7 @@ deny_external_egress_if_tainted = true
     )
     .expect("Start untrusted sidecar");
 
-    let stream3 = TcpStream::connect(&sidecar_untrusted.addr).expect("Client 3 connect");
+    let stream3 = TcpStream::connect(sidecar_untrusted.addr.as_str()).expect("Client 3 connect");
     let mut reader3 = BufReader::new(stream3.try_clone().unwrap());
     let mut writer3 = stream3;
 
@@ -1061,4 +1072,220 @@ fn test_replay_guard_fail_closed_under_load() {
         guard.check_and_record(7).is_ok(),
         "Tras expirar TTL, nueva entrada debe tener éxito"
     );
+}
+
+#[test]
+fn test_multi_sidecar_and_restart_no_replay_collision() {
+    let mock_server = MockToolServer::spawn();
+    let psk = [0x42u8; 16];
+    let config = SidecarConfig {
+        psk: Some(psk),
+        ..Default::default()
+    };
+    let gateway = McpGatewayServer::start("127.0.0.1:0", mock_server.addr.clone(), config.clone())
+        .expect("Start gateway");
+
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
+        1001,
+        "cli:agent",
+        false,
+    )));
+    let firewall = CognitiveFirewall::new(UserGovernancePolicy::default());
+
+    // 1. Instancia Sidecar 1
+    let sidecar1 = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall.clone(),
+        Arc::clone(&taint_context),
+        config.clone(),
+    )
+    .expect("Start sidecar 1");
+
+    let req1 = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "lookup",
+            "arguments": { "query": "first" }
+        }
+    });
+    let resp1 = send_mcp_request(sidecar1.addr.as_str(), &req1);
+    assert_eq!(resp1["result"]["status"], "success");
+
+    // 2. Simular reinicio del Sidecar 1 (drop y recreación dentro de la ventana de replay del Gateway)
+    drop(sidecar1);
+
+    // 3. Crear Sidecar 2 y Sidecar 3 en paralelo contra el mismo Gateway
+    let sidecar2 = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall.clone(),
+        Arc::clone(&taint_context),
+        config.clone(),
+    )
+    .expect("Start sidecar 2");
+
+    let sidecar3 = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        Arc::clone(&taint_context),
+        config,
+    )
+    .expect("Start sidecar 3");
+
+    // Ambos emiten un request con id: 1 (que con el generador monotónico antiguo habría colisionado en UUID = 1)
+    let req2 = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "lookup",
+            "arguments": { "query": "second" }
+        }
+    });
+    let resp2 = send_mcp_request(sidecar2.addr.as_str(), &req2);
+    assert_eq!(
+        resp2["result"]["status"], "success",
+        "Sidecar 2 reiniciado no debe colisionar con UUIDs anteriores"
+    );
+
+    let req3 = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "lookup",
+            "arguments": { "query": "third" }
+        }
+    });
+    let resp3 = send_mcp_request(sidecar3.addr.as_str(), &req3);
+    assert_eq!(
+        resp3["result"]["status"], "success",
+        "Sidecar 3 concurrente no debe colisionar con Sidecar 2"
+    );
+}
+
+#[test]
+fn test_graceful_shutdown_waits_for_inflight_request() {
+    // Mock server que introduce un delay de 120 ms
+    let mock_server = MockToolServer::spawn_with_delay(Duration::from_millis(120));
+    let config = SidecarConfig {
+        drain_timeout: Duration::from_millis(2000),
+        ..Default::default()
+    };
+    let gateway = McpGatewayServer::start("127.0.0.1:0", mock_server.addr.clone(), config.clone())
+        .expect("Start gateway");
+
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
+        1001,
+        "cli:agent",
+        false,
+    )));
+    let firewall = CognitiveFirewall::new(UserGovernancePolicy::default());
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        taint_context,
+        config,
+    )
+    .expect("Start sidecar");
+
+    let sidecar_addr = sidecar.addr.clone();
+
+    // Hilo cliente que lanza una petición en vuelo
+    let client_handle = thread::spawn(move || {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "slow_task",
+                "arguments": { "task": "drain_test" }
+            }
+        });
+        send_mcp_request(sidecar_addr.as_str(), &req)
+    });
+
+    // Esperar a que la petición sea aceptada y esté en vuelo en el Sidecar
+    thread::sleep(Duration::from_millis(30));
+    assert!(
+        sidecar.active_connections.load(Ordering::SeqCst) > 0,
+        "Debe haber al menos 1 conexión activa en vuelo"
+    );
+
+    // Ejecutar shutdown graceful mientras la petición sigue procesándose en el backend
+    let shutdown_start = Instant::now();
+    sidecar.shutdown();
+    let shutdown_duration = shutdown_start.elapsed();
+
+    // Comprobar que shutdown esperó a que se completara la petición en vuelo
+    assert!(
+        shutdown_duration >= Duration::from_millis(60),
+        "Shutdown debió esperar al drenaje de la petición en vuelo (tomó {:?})",
+        shutdown_duration
+    );
+
+    let resp = client_handle.join().expect("Client thread join");
+    assert_eq!(resp["result"]["status"], "success");
+    assert_eq!(resp["result"]["echo"]["task"], "drain_test");
+}
+
+#[test]
+fn test_mcp_expanded_methods_routing() {
+    let mock_server = MockToolServer::spawn();
+    let gateway = McpGatewayServer::start(
+        "127.0.0.1:0",
+        mock_server.addr.clone(),
+        SidecarConfig::default(),
+    )
+    .expect("Start gateway");
+
+    let taint_context = Arc::new(Mutex::new(ProcessTaintContext::new(
+        1001,
+        "cli:agent",
+        false,
+    )));
+    let firewall = CognitiveFirewall::new(UserGovernancePolicy::default());
+
+    let sidecar = McpSidecarServer::start(
+        "127.0.0.1:0",
+        gateway.addr.clone(),
+        firewall,
+        taint_context,
+        SidecarConfig::default(),
+    )
+    .expect("Start sidecar");
+
+    let test_methods = vec![
+        ("initialize", json!({"protocolVersion": "2024-11-05"})),
+        ("ping", json!({})),
+        ("tools/list", json!({})),
+        ("prompts/list", json!({})),
+        ("resources/list", json!({})),
+        (
+            "resources/read",
+            json!({"uri": "file:///workspace/test.txt"}),
+        ),
+        ("prompts/get", json!({"name": "system_prompt"})),
+    ];
+
+    for (idx, (method, params)) in test_methods.into_iter().enumerate() {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": idx + 100,
+            "method": method,
+            "params": params
+        });
+        let resp = send_mcp_request(sidecar.addr.as_str(), &req);
+        assert_eq!(
+            resp["result"]["status"], "success",
+            "Método MCP '{}' debe ser soportado y responder success",
+            method
+        );
+    }
 }
