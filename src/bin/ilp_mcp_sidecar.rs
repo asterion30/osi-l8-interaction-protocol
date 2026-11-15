@@ -385,9 +385,50 @@ fn main() {
     };
 
     println!("✓ Servidor Sidecar activo y escuchando en {}", server.addr);
-    println!("Presiona Ctrl+C para detener el daemon.\n");
+    println!("Presiona Ctrl+C o envía SIGTERM para detener el daemon.\n");
 
+    #[cfg(unix)]
+    setup_signal_handlers();
+
+    #[cfg(unix)]
+    while !SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    #[cfg(not(unix))]
     loop {
         std::thread::park();
     }
+
+    println!("\n[INFO] Señal de terminación recibida en Sidecar. Iniciando apagado ordenado...");
+    server.shutdown();
+    let m = server.metrics();
+    println!(
+        "[INFO] Apagado completado. Métricas finales: total_requests={}, accepted_connections={}, dropped_evaluations={}, auth_failures={}, replay_drops={}",
+        m.total_requests, m.accepted_connections, m.dropped_evaluations, m.auth_failures, m.replay_drops
+    );
+    std::process::exit(0);
+}
+
+#[cfg(unix)]
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_signal(_sig: std::os::raw::c_int) {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn setup_signal_handlers() {
+    unsafe {
+        libc_signal(2, handle_signal); // SIGINT = 2
+        libc_signal(15, handle_signal); // SIGTERM = 15
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "signal"]
+    fn libc_signal(sig: std::os::raw::c_int, handler: extern "C" fn(std::os::raw::c_int)) -> usize;
 }

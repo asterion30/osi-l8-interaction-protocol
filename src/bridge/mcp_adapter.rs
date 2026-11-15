@@ -253,9 +253,9 @@ impl McpSessionCorrelationTable {
             return Err(McpBridgeError::CapacityExceeded);
         }
 
-        let mut session_uuid = crate::ipdu::auth::generate_cryptographic_session_uuid();
+        let mut session_uuid = crate::ipdu::auth::generate_cryptographic_session_uuid()?;
         while map.values().any(|s| s.session_uuid == session_uuid) {
-            session_uuid = crate::ipdu::auth::generate_cryptographic_session_uuid();
+            session_uuid = crate::ipdu::auth::generate_cryptographic_session_uuid()?;
         }
 
         map.insert(

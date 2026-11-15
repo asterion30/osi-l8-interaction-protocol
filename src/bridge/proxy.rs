@@ -661,7 +661,7 @@ impl McpSidecarServer {
                                                 packet.header().deadline_ttl_ms,
                                                 packet.header().max_budget_cap,
                                                 false,
-                                                packet.payload_mut(),
+                                                packet.payload_bytes_mut(),
                                             );
                                             packet.set_policy_flags(
                                                 packet.header().policy_flags
@@ -743,7 +743,7 @@ impl McpSidecarServer {
                                                                     .deadline_ttl_ms,
                                                                 resp_packet.header().max_budget_cap,
                                                                 true,
-                                                                resp_packet.payload_mut(),
+                                                                resp_packet.payload_bytes_mut(),
                                                             );
                                                         }
 
@@ -1147,7 +1147,7 @@ impl McpGatewayServer {
                                         packet.header().deadline_ttl_ms,
                                         packet.header().max_budget_cap,
                                         false,
-                                        plaintext_packet.payload_mut(),
+                                        plaintext_packet.payload_bytes_mut(),
                                     );
                                 }
 
@@ -1274,7 +1274,7 @@ impl McpGatewayServer {
                                         resp_packet.header().deadline_ttl_ms,
                                         resp_packet.header().max_budget_cap,
                                         true,
-                                        resp_packet.payload_mut(),
+                                        resp_packet.payload_bytes_mut(),
                                     );
                                 }
 

@@ -130,11 +130,16 @@ pub fn serialize_header_mac_input(header: &IpduHeader) -> [u8; 28] {
 }
 
 /// Calcula el MAC de integridad de la trama I-PDU usando SipHash-2-4 con clave secreta de 128 bits.
-/// Cubre los 28 bytes de la cabecera fija más la totalidad del payload.
+/// Cubre:
+/// 1. Los 28 bytes canónicos de la cabecera fija.
+/// 2. Los 4 bytes del prefijo de longitud en Network Byte Order (Big-Endian).
+/// 3. La totalidad del payload (o ciphertext en tramas cifradas).
 pub fn compute_frame_mac(header: &IpduHeader, payload: &[u8], secret_key: &[u8; 16]) -> u64 {
     let mut hasher = SipHash24::new_with_key(secret_key);
     let hdr_bytes = serialize_header_mac_input(header);
     hasher.update(&hdr_bytes);
+    let len_bytes = (payload.len() as u32).to_be_bytes();
+    hasher.update(&len_bytes);
     hasher.update(payload);
     hasher.finish()
 }
@@ -221,62 +226,48 @@ pub fn load_psk_from_file_secure(path: &str) -> Result<[u8; 16], String> {
 
 /// Genera un identificador de sesión pseudoaleatorio criptográfico (CSPRNG) de 64 bits sin dependencias externas (`std` puro).
 ///
-/// **Estrategia de Entropía**:
+/// **Garantía Estricta Fail-Closed**:
 /// - En sistemas Unix (`#[cfg(unix)]`), lee 8 bytes directamente del dispositivo de entropía del kernel `/dev/urandom`.
-/// - Si `/dev/urandom` no estuviera disponible o en entornos no-Unix, utiliza como fallback la semilla de dos
-///   instancias de `std::collections::hash_map::RandomState` (las cuales el runtime de Rust inicializa mediante
-///   `getrandom` del sistema operativo), combinadas con el PID del proceso (`std::process::id()`), la marca de tiempo
-///   en nanosegundos (`SystemTime::now()`) y un contador atómico local, procesadas mediante una ronda de `SipHash24`.
+/// - Si `/dev/urandom` no estuviera disponible o fallara la lectura, la función NO degrada a un generador débil:
+///   falla de inmediato retornando `Err(IpduError::Io(...))`.
+/// - En entornos no-Unix, falla devolviendo `Err(IpduError::Io(...))`.
 ///
-/// **Invariante**: El valor retornado garantiza ser estrictamente distinto de cero (si resulta 0, se mapea a 1).
-pub fn generate_cryptographic_session_uuid() -> u64 {
+/// **Invariante**: El valor retornado garantiza ser estrictamente distinto de cero (si resulta 0, se re-lee o mapea a 1).
+pub fn generate_cryptographic_session_uuid() -> Result<u64, super::header::IpduError> {
     #[cfg(unix)]
     {
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            let mut buf = [0u8; 8];
-            if f.read_exact(&mut buf).is_ok() {
-                let val = u64::from_le_bytes(buf);
-                if val != 0 {
-                    return val;
-                }
+        use std::io::Read;
+        let mut f = std::fs::File::open("/dev/urandom").map_err(|e| {
+            super::header::IpduError::Io(format!(
+                "Fallo al abrir fuente de entropía /dev/urandom: {}",
+                e
+            ))
+        })?;
+        let mut buf = [0u8; 8];
+        f.read_exact(&mut buf).map_err(|e| {
+            super::header::IpduError::Io(format!("Fallo al leer entropía de /dev/urandom: {}", e))
+        })?;
+        let mut val = u64::from_le_bytes(buf);
+        if val == 0 {
+            f.read_exact(&mut buf).map_err(|e| {
+                super::header::IpduError::Io(format!(
+                    "Fallo al re-leer entropía de /dev/urandom: {}",
+                    e
+                ))
+            })?;
+            val = u64::from_le_bytes(buf);
+            if val == 0 {
+                val = 1;
             }
         }
+        Ok(val)
     }
 
-    fallback_session_uuid()
-}
-
-fn fallback_session_uuid() -> u64 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::SystemTime;
-
-    static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
-    let counter = FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    let s1 = RandomState::new().build_hasher().finish();
-    let s2 = RandomState::new().build_hasher().finish();
-
-    let mut key = [0u8; 16];
-    key[..8].copy_from_slice(&s1.to_le_bytes());
-    key[8..].copy_from_slice(&s2.to_le_bytes());
-
-    let mut hasher = SipHash24::new_with_key(&key);
-    hasher.update(&pid.to_le_bytes());
-    hasher.update(&now.to_le_bytes());
-    hasher.update(&counter.to_le_bytes());
-    let val = hasher.finish();
-    if val == 0 {
-        1
-    } else {
-        val
+    #[cfg(not(unix))]
+    {
+        Err(super::header::IpduError::Io(
+            "CSPRNG fail-closed: la plataforma actual requiere soporte del dispositivo /dev/urandom".to_string(),
+        ))
     }
 }
 
@@ -373,7 +364,7 @@ mod tests {
 
         let mut seen = HashSet::new();
         for _ in 0..1000 {
-            let uuid = generate_cryptographic_session_uuid();
+            let uuid = generate_cryptographic_session_uuid().expect("CSPRNG exitoso");
             assert_ne!(uuid, 0, "session_uuid jamás debe ser cero");
             assert!(
                 seen.insert(uuid),

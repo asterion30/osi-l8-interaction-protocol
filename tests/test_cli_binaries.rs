@@ -388,3 +388,87 @@ fn test_cli_binaries_hardlink_psk_rejected() {
 
     let _ = std::fs::remove_file(&target_path);
 }
+
+#[test]
+fn test_daemons_graceful_shutdown_on_sigterm() {
+    #[cfg(unix)]
+    {
+        let sidecar_bin = env!("CARGO_BIN_EXE_ilp_mcp_sidecar");
+        let gateway_bin = env!("CARGO_BIN_EXE_ilp_mcp_gateway");
+
+        // 1. Obtener puertos únicos sin pre-binding
+        use std::sync::atomic::AtomicU16;
+        static SHUTDOWN_PORT: AtomicU16 = AtomicU16::new(200);
+        let offset = SHUTDOWN_PORT.fetch_add(2, Ordering::SeqCst);
+        let pid_offset = (std::process::id() as u16 % 500) * 4;
+        let gw_port = 32000 + pid_offset + offset;
+        let sc_port = gw_port + 1;
+        let gw_addr = format!("127.0.0.1:{}", gw_port);
+        let sc_addr = format!("127.0.0.1:{}", sc_port);
+
+        let mut gw_child = Command::new(gateway_bin)
+            .args([
+                "--listen",
+                &gw_addr,
+                "--backend",
+                "127.0.0.1:54321",
+                "--psk",
+                "0123456789abcdef0123456789abcdef",
+            ])
+            .spawn()
+            .expect("Spawn gateway daemon");
+
+        let mut sc_child = Command::new(sidecar_bin)
+            .args([
+                "--listen",
+                &sc_addr,
+                "--gateway",
+                &gw_addr,
+                "--policy",
+                "policies/default_msac.conf",
+                "--psk",
+                "0123456789abcdef0123456789abcdef",
+            ])
+            .spawn()
+            .expect("Spawn sidecar daemon");
+
+        // Esperar a que ambos daemons comiencen a escuchar
+        let mut ready = false;
+        for _ in 0..50 {
+            if TcpStream::connect(&gw_addr).is_ok() && TcpStream::connect(&sc_addr).is_ok() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready, "Los daemons deben estar listos y escuchando");
+
+        // 3. Enviar SIGTERM (15) vía kill POSIX
+        extern "C" {
+            #[link_name = "kill"]
+            fn libc_kill(pid: i32, sig: i32) -> i32;
+        }
+
+        unsafe {
+            let res_sc = libc_kill(sc_child.id() as i32, 15);
+            assert_eq!(res_sc, 0, "kill SIGTERM exitoso a sidecar");
+            let res_gw = libc_kill(gw_child.id() as i32, 15);
+            assert_eq!(res_gw, 0, "kill SIGTERM exitoso a gateway");
+        }
+
+        // 4. Validar que ambos procesos salen limpiamente con código 0
+        let sc_status = sc_child.wait().expect("Wait for sidecar shutdown");
+        assert!(
+            sc_status.success(),
+            "Sidecar debe salir con exit code 0 tras SIGTERM, obtenido: {:?}",
+            sc_status.code()
+        );
+
+        let gw_status = gw_child.wait().expect("Wait for gateway shutdown");
+        assert!(
+            gw_status.success(),
+            "Gateway debe salir con exit code 0 tras SIGTERM, obtenido: {:?}",
+            gw_status.code()
+        );
+    }
+}

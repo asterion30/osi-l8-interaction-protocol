@@ -8,15 +8,15 @@ Este documento detalla la metodología, cobertura y resultados de la suite de pr
 
 | Módulo Evaluado | Archivo de Test | Pruebas | Resultado | Cobertura Funcional |
 | :--- | :--- | :---: | :---: | :--- |
-| **I-PDU Wire, Crypto & Auth** | `tests/test_ipdu_wire.rs` + `src/ipdu/auth.rs` + `src/ipdu/crypto.rs` | 15 | **100% PASS** | Empaquetado binario Big-Endian, Word 0 bitfields, cabecera canónica (36B), cabecera compacta (32B), defensa anti Allocation Bomb, simetría binaria, autenticación SipHash-2-4 con PSK 128-bit mitigado con barrera `black_box`, vectores oficiales INDOCRYPT 2012, generador CSPRNG/entropía de 64 bits para `session_uuid`, y cifrador de flujo ChaCha20 puro (RFC 8439) con vectores oficiales de Sección 2.3.2 y separación estricta de nonces de 96 bits. |
+| **I-PDU Wire, Crypto & Auth** | `tests/test_ipdu_wire.rs` + `src/ipdu/auth.rs` + `src/ipdu/crypto.rs` | 16 | **100% PASS** | Empaquetado binario Big-Endian, Word 0 bitfields, cabecera canónica (36B), cabecera compacta (32B), defensa anti Allocation Bomb, simetría binaria, autenticación SipHash-2-4 con PSK 128-bit absorbiendo cabecera y Length-Prefix de 4 bytes, mitigado con barrera `black_box`, vectores oficiales INDOCRYPT 2012, generador CSPRNG/entropía estricto fail-closed (/dev/urandom) para `session_uuid`, y cifrador de flujo ChaCha20 puro (RFC 8439) con vectores oficiales de Sección 2.3.2 y separación estricta de nonces de 96 bits. |
 | **Cognitive Firewall (MSAC)** | `tests/test_firewall_msac.rs` | 16 | **100% PASS** | Pipeline MSAC de 3 pasos: Taint Tracking monotónico con encapsulamiento estricto, cobertura exhaustiva de todas las etiquetas sensibles (`ALL_SENSITIVE`), parser declarativo `.conf` con patrones DLP personalizados (`custom_dlp_deny_pattern`), rechazo de duplicados y límites de tier (<= 63), límites O(1), DLP/Prompt Injection, serialización forense JSONL para SIEM (`to_jsonl_line`) y Ring Buffer acotado. |
 | **Transport Session & FSM** | `tests/test_transport_fsm.rs` | 7 | **100% PASS** | Máquina de estados finita por roles (`SessionRole::Initiator` vs `SessionRole::Responder`), mutación atómica post-E/S, verificación estricta de `session_uuid`, plazos monotónicos dinámicos con `SetSocketTimeout`, timeout inicial contra Slowloris en `Responder`, y flujo completo de 5 pasos desde `DiscoverSkill` hasta `AttestResult` sobre TCP real. |
 | **TCP Sockets & Transport** | `tests/test_tcp_transport.rs` | 4 | **100% PASS** | Framing sobre streams TCP reales, contención de Allocation Bomb y serialización/deserialización en bucle. |
 | **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 11 | **100% PASS** | Mapeo estricto de llamadas MCP JSON-RPC, respuestas y errores; rechazo de IDs en vuelo duplicados, expiración estricta en `resolve_session`, purga automática por TTL y cota fija (1024). |
 | **MCP Proxy E2E Enforcement** | `tests/test_mcp_proxy_e2e.rs` | 18 | **100% PASS** | Servidores de producción (`McpSidecarServer` + `McpGatewayServer`) con túnel 100% binario I-PDU. Cifrado simétrico de payload ChaCha20 (RFC 8439) confidencial en cable (Encrypt-then-MAC), rotación de claves en caliente sin caídas (Dual-PSK), logs forenses JSONL estructurados (`--audit-log`), telemetría atómica (`ServerMetricsSnapshot`), demostración Zero-Connect, cota de línea 64 KiB, concurrencia atómica (CAS), anti-Slowloris con deadline total, auto-manchado dinámico por DLP en ingress, propagación de errores `-32002`, autenticación PSK con SipHash-2-4, orden Verify-Then-Parse, protección anti-replay fail-closed con `ReplayGuard` (-32003), aislamiento estricto de tinte por cliente, anti-colisión CSPRNG en reinicios y multi-sidecar, shutdown graceful con drenaje de conexiones en vuelo, y soporte expandido de métodos MCP. |
-| **CLI Production Binaries** | `tests/test_cli_binaries.rs` | 7 | **100% PASS** | Subprocesos reales de `ilp_mcp_sidecar` e `ilp_mcp_gateway`: flags `--check-config`, guardrail de red no-loopback, carga segura de PSK vía `--psk-file` (permisos Unix 0600 requeridos, rechazo obligatorio de symlinks y hardlinks concurrentes) y variable de entorno `ILP_PSK_HEX`, y flujo E2E completo autenticado por PSK. |
+| **CLI Production Binaries** | `tests/test_cli_binaries.rs` | 8 | **100% PASS** | Subprocesos reales de `ilp_mcp_sidecar` e `ilp_mcp_gateway`: flags `--check-config`, guardrail de red no-loopback, carga segura de PSK vía `--psk-file` (permisos Unix 0600 requeridos, rechazo obligatorio de symlinks y hardlinks concurrentes) y variable de entorno `ILP_PSK_HEX`, flujo E2E completo autenticado por PSK, y captura de señales SIGINT/SIGTERM con apagado ordenado y salida código 0. |
 | **Protocol Handshake** | `tests/test_handshake_simulation.rs` | 1 | **100% PASS** | Negociación completa del 3-Way Intent Handshake entre Cliente y Proveedor con auditoría en ambos firewalls. |
-| **Total General** | **8 Suites + Unit Tests** | **79** | **79 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
+| **Total General** | **8 Suites + Unit Tests** | **81** | **81 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
 
 ---
 
@@ -50,6 +50,8 @@ Este documento detalla la metodología, cobertura y resultados de la suite de pr
     - Valida la conformidad estricta contra los vectores de prueba canónicos del paper original de SipHash (*Aumasson & Bernstein, INDOCRYPT 2012, Appendix A*): entrada vacía (`0x726fdb47dd0e0e31`), 1 byte (`0x74f839c593dc67fd`), y 15 bytes (`0xa129ca6149be45e5`).
 12. **`test_generate_cryptographic_session_uuid_entropy_and_non_zero` (`src/ipdu/auth.rs`)**:
     - Valida que el generador criptográfico de `session_uuid` produzca identificadores de 64 bits con entropía adecuada, sin colisiones en secuencias de 1,000 muestras, preservando el invariante de seguridad `uuid != 0` para evitar bloqueos por falso positivo en ReplayGuard.
+13. **`test_mac_authenticates_length_prefix` (`tests/test_ipdu_wire.rs`)**:
+    - Valida que la firma MAC SipHash-2-4 absorba obligatoriamente los 4 bytes del prefijo de longitud (`Length-Prefix` en Big-Endian) además de la cabecera canónica y el payload, asegurando que cualquier manipulación o truncamiento del tamaño de trama invalide la autenticación de Capa 8.
 
 ---
 
@@ -196,6 +198,8 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
    - Valida que `load_psk_from_file_secure` rechace explícitamente cualquier `--psk-file` que sea un enlace simbólico (*symlink*), mitigando ataques de escalada y condiciones TOCTOU en `ilp_mcp_sidecar` e `ilp_mcp_gateway`.
 7. **`test_cli_binaries_hardlink_psk_rejected`**:
    - Valida que `load_psk_from_file_secure` rechace archivos de clave que posean enlaces duros concurrentes (`nlink > 1`), asegurando acceso exclusivo de propietario según especificación POSIX.
+8. **`test_daemons_graceful_shutdown_on_sigterm`**:
+   - Valida la captura de señales POSIX (`SIGINT` / `SIGTERM`) en `ilp_mcp_sidecar` e `ilp_mcp_gateway`: al recibir `SIGTERM`, los daemons interrumpen su bucle de espera, invocan `server.shutdown()`, vuelcan sus métricas operativas finales y salen limpiamente con código `0`.
 
 ---
 
@@ -211,7 +215,7 @@ cargo test --locked --all-targets --all-features
 
 Salida esperada:
 ```text
-test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ---

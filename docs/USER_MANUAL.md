@@ -55,7 +55,7 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 # Compilar la biblioteca y binarios
 cargo build --locked
 
-# Ejecutar la suite completa de tests unitarios y de integración (79 tests)
+# Ejecutar la suite completa de tests unitarios y de integración (81 tests)
 cargo test --locked --all-targets --all-features
 
 # Auditar y verificar el conteo formal de pruebas

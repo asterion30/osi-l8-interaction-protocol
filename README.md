@@ -80,7 +80,7 @@ El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento
 ## 🚀 Inicio Rápido (Quickstart)
 
 ```bash
-# 1. Ejecutar la suite completa de 79 pruebas de integración y unitarias
+# 1. Ejecutar la suite completa de 81 pruebas de integración y unitarias
 cargo test --locked --all-targets --all-features
 
 # 2. Auditar formalmente el conteo de pruebas por componente
@@ -274,15 +274,15 @@ osi-l8-interaction-protocol/
 │   │   └── ilp_mcp_gateway.rs                            # Daemon autónomo CLI de producción MCP Gateway
 │   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway, Dual-PSK, ChaCha20)
 │   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 79 tests de integración y verificación E2E (100% pasando)
-│   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking y simetría binaria (9 tests)
+├── tests/                                                # 81 tests de integración y verificación E2E (100% pasando)
+│   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking, length-prefix MAC y simetría binaria (10 tests)
 │   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint, custom DLP y MSAC (16 tests)
 │   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (7 tests)
 │   ├── test_tcp_transport.rs                             # Sockets TCP reales y contención OOM (4 tests)
 │   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
 │   ├── test_mcp_bridge.rs                                # Mapeo estricto, correlación con TTL, purga e in-flight (11 tests)
 │   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: ChaCha20, Dual-PSK, JSONL SIEM, Slowloris, ReplayGuard (18 tests)
-│   └── test_cli_binaries.rs                              # Subprocess smoke tests CLI Gateway y Sidecar, rechazo de symlink/hardlink, PSK file/env (7 tests)
+│   └── test_cli_binaries.rs                              # Subprocess smoke tests CLI, rechazo symlink/hardlink, SIGTERM graceful (8 tests)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
     ├── live_agent_proxy.rs                               # Comunicación en vivo entre 2 agentes por TCP

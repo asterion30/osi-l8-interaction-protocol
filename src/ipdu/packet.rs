@@ -92,9 +92,10 @@ impl IpduPacket {
         &self.payload
     }
 
-    /// Retorna una referencia mutable al payload del paquete (para cifrado/descifrado in-place).
+    /// Retorna una referencia mutable a los bytes del payload (para cifrado/descifrado in-place sin alteración de tamaño).
+    /// El retorno de `&mut [u8]` garantiza en tiempo de compilación que no se pueda modificar la longitud ya validada.
     #[inline]
-    pub fn payload_mut(&mut self) -> &mut [u8] {
+    pub fn payload_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.payload
     }
 

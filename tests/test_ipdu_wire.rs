@@ -191,3 +191,46 @@ fn test_validate_frame_bounds_trailing_bytes() {
         Err(IpduError::TrailingBytes(7))
     ));
 }
+
+#[test]
+fn test_mac_authenticates_length_prefix() {
+    use ilp_core::ipdu::auth::{compute_frame_mac, verify_frame_mac};
+
+    let key = [0x55u8; 16];
+    let header = IpduHeader::new(
+        Performative::ProposeIntent,
+        1,
+        CognitivePolicyFlags::EMPTY,
+        0x1234_5678,
+        0x9999_8888,
+        1000,
+        5000,
+        0,
+    )
+    .unwrap();
+
+    let payload = b"{\"action\":\"execute_transfer\",\"amount\":100}";
+    let original_mac = compute_frame_mac(&header, payload, &key);
+
+    // 1. MAC válido sobre payload y longitud original
+    assert!(verify_frame_mac(&header, payload, &key, original_mac));
+
+    // 2. Si se altera la longitud (truncado o extendido), verify_frame_mac falla
+    let truncated_payload = &payload[..payload.len() - 1];
+    assert!(!verify_frame_mac(
+        &header,
+        truncated_payload,
+        &key,
+        original_mac
+    ));
+
+    let extended_payload = b"{\"action\":\"execute_transfer\",\"amount\":100} ";
+    let extended_mac = compute_frame_mac(&header, extended_payload, &key);
+    assert_ne!(original_mac, extended_mac);
+    assert!(!verify_frame_mac(
+        &header,
+        extended_payload,
+        &key,
+        original_mac
+    ));
+}

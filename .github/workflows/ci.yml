@@ -52,6 +52,9 @@ jobs:
       - name: Run All Tests (Including MCP Feature)
         run: cargo test --locked --all-features --verbose
 
+      - name: Verify Strict Test Count Audit
+        run: ./scripts/verify_test_count.sh
+
   examples-verification:
     name: Live Demos & Micro-Benchmarks
     runs-on: ubuntu-latest

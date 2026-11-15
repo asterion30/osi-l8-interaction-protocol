@@ -7,11 +7,14 @@ echo "=================================================================="
 echo "    ILP PROTOCOL TEST SUITE AUDIT & COUNT VERIFICATION           "
 echo "=================================================================="
 
+set +e
 OUTPUT=$(cargo test --locked --all-features 2>&1)
 EXIT_CODE=$?
+set -e
 
 if [ $EXIT_CODE -ne 0 ]; then
-    echo "ERROR: 'cargo test --locked --all-features' falló con código $EXIT_CODE"
+    echo "ERROR: 'cargo test --locked --all-features' falló con código $EXIT_CODE:"
+    echo "$OUTPUT"
     exit 1
 fi
 
@@ -48,11 +51,11 @@ if [ "$TOTAL_FAILED" -ne 0 ]; then
     exit 1
 fi
 
-EXPECTED_COUNT=79
+EXPECTED_COUNT=81
 if [ "$TOTAL_PASSED" -ne "$EXPECTED_COUNT" ]; then
-    echo "ADVERTENCIA: Se esperaban $EXPECTED_COUNT pruebas, pero se contaron $TOTAL_PASSED."
-else
-    echo "✓ Todas las $TOTAL_PASSED pruebas pasaron exitosamente y coinciden con la especificación."
+    echo "ERROR: Auditoría fallida. Se esperaban $EXPECTED_COUNT pruebas según la especificación, pero se ejecutaron $TOTAL_PASSED."
+    exit 1
 fi
 
+echo "✓ Todas las $TOTAL_PASSED pruebas pasaron exitosamente y coinciden con la especificación."
 exit 0
