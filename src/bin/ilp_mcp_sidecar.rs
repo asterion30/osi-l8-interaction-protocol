@@ -26,6 +26,9 @@ fn print_help() {
           --trust-client-claims      Acepta claims explícitos _ilp_taint_claim en solicitudes cliente (default: false)\n  \
           --psk-file <RUTA>          Carga clave pre-compartida de 128 bits desde archivo (requiere permisos 0600 o 0400)\n  \
           --psk <HEX_KEY>            [DEPRECATED/TEST-ONLY] Clave pre-compartida en línea de comandos (visible en /proc)\n  \
+          --encrypt-payload          Habilita cifrado ChaCha20 (RFC 8439) en payload de tramas (default: activo)\n  \
+          --no-encrypt-payload       Deshabilita cifrado de payload (transmite JSON-RPC en claro)\n  \
+          --audit-log <RUTA>         Ruta para archivo de log forense estructurado en formato JSONL para SIEM\n  \
           --allow-non-loopback       Permite enlazar a interfaces de red externas (requiere PSK)\n  \
           --check-config             Valida sintaxis de la política y configuración, saliendo con código 0\n  \
           -h, --help                 Muestra esta ayuda y finaliza\n\n\
@@ -80,6 +83,8 @@ fn main() {
     let mut initial_taint_str: Option<String> = None;
     let mut psk_str: Option<String> = None;
     let mut psk_file_path: Option<String> = None;
+    let mut encrypt_payload = true;
+    let mut audit_log_path: Option<String> = None;
     let mut trust_client_claims = false;
     let mut allow_non_loopback = false;
     let mut check_config_only = false;
@@ -97,6 +102,27 @@ fn main() {
             }
             "--allow-non-loopback" => {
                 allow_non_loopback = true;
+                i += 1;
+            }
+            "--encrypt-payload" => {
+                encrypt_payload = true;
+                i += 1;
+            }
+            "--no-encrypt-payload" => {
+                encrypt_payload = false;
+                i += 1;
+            }
+            "--audit-log" => {
+                if i + 1 < args.len() {
+                    audit_log_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --audit-log requiere una ruta de archivo");
+                    std::process::exit(1);
+                }
+            }
+            opt if opt.starts_with("--audit-log=") => {
+                audit_log_path = Some(opt.trim_start_matches("--audit-log=").to_string());
                 i += 1;
             }
             "--trust-client-claims" => {
@@ -335,6 +361,8 @@ fn main() {
 
     let config = SidecarConfig {
         psk: parsed_psk,
+        encrypt_payload,
+        audit_log_path,
         trust_client_taint_claims: trust_client_claims,
         ..Default::default()
     };

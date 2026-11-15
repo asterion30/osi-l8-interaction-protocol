@@ -22,11 +22,17 @@ use crate::governance::taint::{ProcessTaintContext, TaintTag};
 #[cfg(feature = "mcp")]
 use crate::ipdu::auth::{compute_frame_mac, verify_frame_mac};
 #[cfg(feature = "mcp")]
+use crate::ipdu::crypto::chacha20_crypt_payload;
+#[cfg(feature = "mcp")]
+use crate::ipdu::flags::CognitivePolicyFlags;
+#[cfg(feature = "mcp")]
 use crate::ipdu::packet::IpduPacket;
 #[cfg(feature = "mcp")]
 use crate::transport::IlpStream;
 #[cfg(feature = "mcp")]
 use std::collections::HashMap;
+#[cfg(feature = "mcp")]
+use std::fs::OpenOptions;
 #[cfg(feature = "mcp")]
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(feature = "mcp")]
@@ -38,10 +44,63 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "mcp")]
 use std::thread;
 #[cfg(feature = "mcp")]
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "mcp")]
 static NEXT_CLIENT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "mcp")]
+/// Instantánea inmutable de telemetría y métricas operativas de servidores Capa 8.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ServerMetricsSnapshot {
+    pub total_requests: u64,
+    pub active_connections: usize,
+    pub accepted_connections: usize,
+    pub dropped_evaluations: u64,
+    pub auth_failures: u64,
+    pub replay_drops: u64,
+    pub key_rotations_accepted: u64,
+}
+
+#[cfg(feature = "mcp")]
+/// Contadores atómicos de métricas operativas para alta concurrencia.
+#[derive(Debug, Default)]
+pub struct ServerMetrics {
+    pub total_requests: AtomicU64,
+    pub dropped_evaluations: AtomicU64,
+    pub auth_failures: AtomicU64,
+    pub replay_drops: AtomicU64,
+    pub key_rotations_accepted: AtomicU64,
+}
+
+#[cfg(feature = "mcp")]
+impl ServerMetrics {
+    pub fn snapshot(
+        &self,
+        active_connections: usize,
+        accepted_connections: usize,
+    ) -> ServerMetricsSnapshot {
+        ServerMetricsSnapshot {
+            total_requests: self.total_requests.load(Ordering::Relaxed),
+            active_connections,
+            accepted_connections,
+            dropped_evaluations: self.dropped_evaluations.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            replay_drops: self.replay_drops.load(Ordering::Relaxed),
+            key_rotations_accepted: self.key_rotations_accepted.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(feature = "mcp")]
+/// Escribe de forma segura una línea en el archivo de log de auditoría en formato JSONL.
+fn write_audit_log_line(path: Option<&str>, line: &str) {
+    if let Some(p) = path {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(p) {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
 
 #[cfg(feature = "mcp")]
 /// Errores operativos del proxy y servidores de Capa 8.
@@ -120,6 +179,12 @@ pub struct SidecarConfig {
     pub deadline_ttl_ms: u32,
     /// Clave pre-compartida (PSK) opcional de 128 bits para autenticación MAC de tramas.
     pub psk: Option<[u8; 16]>,
+    /// Clave previa de 128 bits para rotación sin interrupciones (Zero-Downtime Key Rotation) en Gateway.
+    pub psk_previous: Option<[u8; 16]>,
+    /// Si es true (default), cifra el payload de la trama I-PDU con ChaCha20 y activa CognitivePolicyFlags::ENCRYPTED_PAYLOAD.
+    pub encrypt_payload: bool,
+    /// Ruta de archivo para volcado forense estructurado en formato JSONL para SIEM / Wazuh.
+    pub audit_log_path: Option<String>,
     /// Si es false (default en producción), ignora claims de tinte no autenticados enviados por el cliente.
     pub trust_client_taint_claims: bool,
     /// Tiempo máximo de espera para drenar conexiones activas durante un apagado graceful. Default: 2.000 ms.
@@ -137,6 +202,9 @@ impl Default for SidecarConfig {
             budget_cap: 10_000,
             deadline_ttl_ms: 5_000,
             psk: None,
+            psk_previous: None,
+            encrypt_payload: true,
+            audit_log_path: None,
             trust_client_taint_claims: false,
             drain_timeout: Duration::from_millis(2_000),
         }
@@ -430,10 +498,17 @@ pub struct McpSidecarServer {
     pub active_connections: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     pub drain_timeout: Duration,
+    pub metrics: Arc<ServerMetrics>,
 }
 
 #[cfg(feature = "mcp")]
 impl McpSidecarServer {
+    /// Retorna una instantánea inmutable de las métricas operativas del Sidecar.
+    pub fn metrics(&self) -> ServerMetricsSnapshot {
+        self.metrics
+            .snapshot(self.active_connections.load(Ordering::Relaxed), 0)
+    }
+
     /// Inicia el servidor sidecar en un hilo de fondo.
     pub fn start(
         listen_addr: &str,
@@ -450,9 +525,11 @@ impl McpSidecarServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicUsize::new(0));
         let correlation = Arc::new(McpSessionCorrelationTable::new());
+        let metrics = Arc::new(ServerMetrics::default());
 
         let shut_clone = Arc::clone(&shutdown);
         let active_clone = Arc::clone(&active_connections);
+        let metrics_accept = Arc::clone(&metrics);
 
         thread::spawn(move || {
             while !shut_clone.load(Ordering::SeqCst) {
@@ -471,6 +548,7 @@ impl McpSidecarServer {
                         let mut firewall_clone = firewall.clone();
                         let corr_ref = Arc::clone(&correlation);
                         let cfg = config.clone();
+                        let metrics_worker = Arc::clone(&metrics_accept);
 
                         thread::spawn(move || {
                             let _permit = permit;
@@ -533,8 +611,11 @@ impl McpSidecarServer {
                                     Err(_) => break,
                                 };
 
+                                metrics_worker
+                                    .total_requests
+                                    .fetch_add(1, Ordering::Relaxed);
+
                                 // Inspección de claims de tinte explícitos en los parámetros de la solicitud
-                                // Solo se aceptan si trust_client_taint_claims está explícitamente habilitado
                                 if cfg.trust_client_taint_claims {
                                     if let Ok(req_val) =
                                         serde_json::from_str::<serde_json::Value>(&line)
@@ -562,8 +643,33 @@ impl McpSidecarServer {
                                     cfg.deadline_ttl_ms,
                                     cfg.session_ttl,
                                 ) {
-                                    Ok(ClientIngressResult::Forwarded { mut packet, .. }) => {
-                                        // Firma de trama con PSK si está configurada
+                                    Ok(ClientIngressResult::Forwarded {
+                                        mut packet,
+                                        decision,
+                                    }) => {
+                                        write_audit_log_line(
+                                            cfg.audit_log_path.as_deref(),
+                                            &decision.audit_record.to_jsonl_line("mcp_sidecar"),
+                                        );
+
+                                        // Cifrado simétrico de payload ChaCha20 (RFC 8439) si está configurado
+                                        if cfg.encrypt_payload {
+                                            let key_bytes = cfg.psk.unwrap_or([0u8; 16]);
+                                            chacha20_crypt_payload(
+                                                &key_bytes,
+                                                packet.header().session_uuid,
+                                                packet.header().deadline_ttl_ms,
+                                                packet.header().max_budget_cap,
+                                                false,
+                                                packet.payload_mut(),
+                                            );
+                                            packet.set_policy_flags(
+                                                packet.header().policy_flags
+                                                    | CognitivePolicyFlags::ENCRYPTED_PAYLOAD,
+                                            );
+                                        }
+
+                                        // Encrypt-then-MAC: Firma criptográfica sobre el ciphertext de la trama
                                         if let Some(ref key) = cfg.psk {
                                             let mac = compute_frame_mac(
                                                 packet.header(),
@@ -583,7 +689,7 @@ impl McpSidecarServer {
 
                                                 let mut ilp_stream = IlpStream::new(gateway_tcp);
                                                 if ilp_stream.send_packet(&packet).is_ok() {
-                                                    if let Ok(resp_packet) =
+                                                    if let Ok(mut resp_packet) =
                                                         ilp_stream.recv_packet()
                                                     {
                                                         // Verificación de MAC en la respuesta si PSK está activa
@@ -596,6 +702,12 @@ impl McpSidecarServer {
                                                                     .header()
                                                                     .user_rule_sig_hash,
                                                             ) {
+                                                                metrics_worker
+                                                                    .auth_failures
+                                                                    .fetch_add(
+                                                                        1,
+                                                                        Ordering::Relaxed,
+                                                                    );
                                                                 let err_resp = serde_json::json!({
                                                                     "jsonrpc": "2.0",
                                                                     "id": null,
@@ -612,6 +724,27 @@ impl McpSidecarServer {
                                                                 let _ = client_writer.flush();
                                                                 break;
                                                             }
+                                                        }
+
+                                                        // Descifrado de la respuesta si viene cifrada con ChaCha20
+                                                        if resp_packet
+                                                            .header()
+                                                            .policy_flags
+                                                            .contains(
+                                                            CognitivePolicyFlags::ENCRYPTED_PAYLOAD,
+                                                        ) {
+                                                            let key_bytes =
+                                                                cfg.psk.unwrap_or([0u8; 16]);
+                                                            chacha20_crypt_payload(
+                                                                &key_bytes,
+                                                                resp_packet.header().session_uuid,
+                                                                resp_packet
+                                                                    .header()
+                                                                    .deadline_ttl_ms,
+                                                                resp_packet.header().max_budget_cap,
+                                                                true,
+                                                                resp_packet.payload_mut(),
+                                                            );
                                                         }
 
                                                         // Taint Ingress Tracking: Detección dinámica de datos sensibles en la respuesta
@@ -710,7 +843,17 @@ impl McpSidecarServer {
                                             }
                                         }
                                     }
-                                    Ok(ClientIngressResult::Blocked { error_response, .. }) => {
+                                    Ok(ClientIngressResult::Blocked {
+                                        error_response,
+                                        decision,
+                                    }) => {
+                                        metrics_worker
+                                            .dropped_evaluations
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        write_audit_log_line(
+                                            cfg.audit_log_path.as_deref(),
+                                            &decision.audit_record.to_jsonl_line("mcp_sidecar"),
+                                        );
                                         // Bloqueo en memoria: CERO conexiones al gateway
                                         let mut err_str = error_response.to_string();
                                         err_str.push('\n');
@@ -762,6 +905,7 @@ impl McpSidecarServer {
             active_connections,
             shutdown,
             drain_timeout,
+            metrics,
         })
     }
 
@@ -794,10 +938,19 @@ pub struct McpGatewayServer {
     pub active_connections: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     pub drain_timeout: Duration,
+    pub metrics: Arc<ServerMetrics>,
 }
 
 #[cfg(feature = "mcp")]
 impl McpGatewayServer {
+    /// Retorna una instantánea inmutable de las métricas operativas del Gateway.
+    pub fn metrics(&self) -> ServerMetricsSnapshot {
+        self.metrics.snapshot(
+            self.active_connections.load(Ordering::Relaxed),
+            self.accepted_connections.load(Ordering::Relaxed),
+        )
+    }
+
     /// Inicia el Gateway en un hilo de fondo.
     pub fn start(
         listen_addr: &str,
@@ -813,11 +966,13 @@ impl McpGatewayServer {
         let accepted_connections = Arc::new(AtomicUsize::new(0));
         let active_connections = Arc::new(AtomicUsize::new(0));
         let replay_guard = Arc::new(Mutex::new(ReplayGuard::new(Duration::from_secs(60), 4096)));
+        let metrics = Arc::new(ServerMetrics::default());
 
         let shut_clone = Arc::clone(&shutdown);
         let accepted_clone = Arc::clone(&accepted_connections);
         let active_clone = Arc::clone(&active_connections);
         let replay_clone = Arc::clone(&replay_guard);
+        let metrics_accept = Arc::clone(&metrics);
 
         thread::spawn(move || {
             while !shut_clone.load(Ordering::SeqCst) {
@@ -836,6 +991,7 @@ impl McpGatewayServer {
                         let backend_target = tool_server_addr.clone();
                         let cfg = config.clone();
                         let replay_ref = Arc::clone(&replay_clone);
+                        let metrics_worker = Arc::clone(&metrics_accept);
 
                         thread::spawn(move || {
                             let _permit = permit;
@@ -844,14 +1000,52 @@ impl McpGatewayServer {
 
                             let mut ilp_stream = IlpStream::new(stream);
                             while let Ok(packet) = ilp_stream.recv_packet() {
-                                // 1. Verify-Then-Parse: Verificación de MAC en la trama recibida si PSK está configurada
-                                if let Some(ref key) = cfg.psk {
-                                    if !verify_frame_mac(
+                                metrics_worker
+                                    .total_requests
+                                    .fetch_add(1, Ordering::Relaxed);
+
+                                // 1. Verify-Then-Parse: Soporte Dual-PSK para rotación de claves en caliente
+                                let mut verified_key: Option<[u8; 16]> = None;
+                                if let Some(ref primary_key) = cfg.psk {
+                                    if verify_frame_mac(
                                         packet.header(),
                                         packet.payload(),
-                                        key,
+                                        primary_key,
                                         packet.header().user_rule_sig_hash,
                                     ) {
+                                        verified_key = Some(*primary_key);
+                                    } else if let Some(ref prev_key) = cfg.psk_previous {
+                                        if verify_frame_mac(
+                                            packet.header(),
+                                            packet.payload(),
+                                            prev_key,
+                                            packet.header().user_rule_sig_hash,
+                                        ) {
+                                            verified_key = Some(*prev_key);
+                                            metrics_worker
+                                                .key_rotations_accepted
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+
+                                    if verified_key.is_none() {
+                                        metrics_worker
+                                            .auth_failures
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        let now_ms = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                            as u64;
+                                        let log_line = format!(
+                                            "{{\"timestamp_ms\":{},\"component\":\"mcp_gateway\",\"session_uuid\":{},\"verdict\":\"DROP\",\"error_code\":-32001,\"reason\":\"Frame MAC authentication failed\"}}\n",
+                                            now_ms, packet.header().session_uuid
+                                        );
+                                        write_audit_log_line(
+                                            cfg.audit_log_path.as_deref(),
+                                            &log_line,
+                                        );
+
                                         let err_resp = McpRpcResponse {
                                             jsonrpc: "2.0".to_string(),
                                             id: serde_json::Value::Null,
@@ -873,7 +1067,7 @@ impl McpGatewayServer {
                                         let mac = compute_frame_mac(
                                             resp_pkt.header(),
                                             resp_pkt.payload(),
-                                            key,
+                                            primary_key,
                                         );
                                         resp_pkt.set_user_rule_sig_hash(mac);
                                         let _ = ilp_stream.send_packet(&resp_pkt);
@@ -887,6 +1081,7 @@ impl McpGatewayServer {
                                     .unwrap()
                                     .check_and_record(packet.header().session_uuid)
                                 {
+                                    metrics_worker.replay_drops.fetch_add(1, Ordering::Relaxed);
                                     let err_msg = match e {
                                         ProxyError::ReplayCapacityExhausted => {
                                             "Gateway replay protection table saturated; try again later"
@@ -895,6 +1090,17 @@ impl McpGatewayServer {
                                             "Replay attack detected: duplicate negotiation session UUID"
                                         }
                                     };
+                                    let now_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u64;
+                                    let log_line = format!(
+                                        "{{\"timestamp_ms\":{},\"component\":\"mcp_gateway\",\"session_uuid\":{},\"verdict\":\"DROP\",\"error_code\":-32003,\"reason\":\"{}\"}}\n",
+                                        now_ms, packet.header().session_uuid, err_msg
+                                    );
+                                    write_audit_log_line(cfg.audit_log_path.as_deref(), &log_line);
+
                                     let err_resp = McpRpcResponse {
                                         jsonrpc: "2.0".to_string(),
                                         id: serde_json::Value::Null,
@@ -913,7 +1119,8 @@ impl McpGatewayServer {
                                         Ok(p) => p,
                                         Err(_) => break,
                                     };
-                                    if let Some(ref key) = cfg.psk {
+                                    let sign_key = verified_key.or(cfg.psk);
+                                    if let Some(ref key) = sign_key {
                                         let mac = compute_frame_mac(
                                             resp_pkt.header(),
                                             resp_pkt.payload(),
@@ -925,8 +1132,27 @@ impl McpGatewayServer {
                                     continue;
                                 }
 
-                                // 3. Deserialización JSON-RPC SOLO tras pasar validación de MAC y Replay
-                                let mcp_req = match McpBridge::unwrap_packet(&packet) {
+                                // 3. Descifrado de Payload ChaCha20 si el flag ENCRYPTED_PAYLOAD está presente
+                                let is_encrypted = packet
+                                    .header()
+                                    .policy_flags
+                                    .contains(CognitivePolicyFlags::ENCRYPTED_PAYLOAD);
+
+                                let mut plaintext_packet = packet.clone();
+                                if is_encrypted {
+                                    let key_bytes = verified_key.or(cfg.psk).unwrap_or([0u8; 16]);
+                                    chacha20_crypt_payload(
+                                        &key_bytes,
+                                        packet.header().session_uuid,
+                                        packet.header().deadline_ttl_ms,
+                                        packet.header().max_budget_cap,
+                                        false,
+                                        plaintext_packet.payload_mut(),
+                                    );
+                                }
+
+                                // 4. Deserialización JSON-RPC SOLO tras pasar validación de MAC, Replay y Descifrado
+                                let mcp_req = match McpBridge::unwrap_packet(&plaintext_packet) {
                                     Ok(req) => req,
                                     Err(e) => {
                                         let err_resp = McpRpcResponse {
@@ -947,7 +1173,8 @@ impl McpGatewayServer {
                                             Ok(p) => p,
                                             Err(_) => break,
                                         };
-                                        if let Some(ref key) = cfg.psk {
+                                        let sign_key = verified_key.or(cfg.psk);
+                                        if let Some(ref key) = sign_key {
                                             let mac = compute_frame_mac(
                                                 resp_pkt.header(),
                                                 resp_pkt.payload(),
@@ -959,6 +1186,18 @@ impl McpGatewayServer {
                                         continue;
                                     }
                                 };
+
+                                // Registro forense en JSONL de la petición aceptada en Gateway
+                                let now_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()
+                                    as u64;
+                                let log_line = format!(
+                                    "{{\"timestamp_ms\":{},\"component\":\"mcp_gateway\",\"session_uuid\":{},\"verdict\":\"ALLOW\",\"reason\":\"Packet accepted and forwarded to backend\"}}\n",
+                                    now_ms, packet.header().session_uuid
+                                );
+                                write_audit_log_line(cfg.audit_log_path.as_deref(), &log_line);
 
                                 // Comunicación con el servidor de herramientas de backend
                                 let backend_result = (|| -> Result<McpRpcResponse, String> {
@@ -1022,7 +1261,26 @@ impl McpGatewayServer {
                                     Err(_) => break,
                                 };
 
-                                if let Some(ref key) = cfg.psk {
+                                // Si la solicitud vino cifrada, ciframos la respuesta con ChaCha20 y nonce disjunto
+                                if is_encrypted {
+                                    let key_bytes = verified_key.or(cfg.psk).unwrap_or([0u8; 16]);
+                                    resp_packet.set_policy_flags(
+                                        resp_packet.header().policy_flags
+                                            | CognitivePolicyFlags::ENCRYPTED_PAYLOAD,
+                                    );
+                                    chacha20_crypt_payload(
+                                        &key_bytes,
+                                        resp_packet.header().session_uuid,
+                                        resp_packet.header().deadline_ttl_ms,
+                                        resp_packet.header().max_budget_cap,
+                                        true,
+                                        resp_packet.payload_mut(),
+                                    );
+                                }
+
+                                // Encrypt-then-MAC: firmamos sobre el ciphertext de la respuesta
+                                let sign_key = verified_key.or(cfg.psk);
+                                if let Some(ref key) = sign_key {
                                     let mac = compute_frame_mac(
                                         resp_packet.header(),
                                         resp_packet.payload(),
@@ -1051,6 +1309,7 @@ impl McpGatewayServer {
             active_connections,
             shutdown,
             drain_timeout,
+            metrics,
         })
     }
 

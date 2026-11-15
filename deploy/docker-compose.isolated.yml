@@ -1,0 +1,128 @@
+version: '3.8'
+
+# RFC-ILP-2026: Topology Isolation & Mandatory Access Control Deployment
+# Enforces Zero-Connect and Network Segmentation:
+# - agent_sandbox_net: internal network (no internet routing, no default gateway).
+#   The Agent container can ONLY speak to the Sidecar ingress on port 9001.
+# - ilp_backbone_net: tunnel network for binary I-PDU frames between Sidecar and Gateway.
+# - tools_backend_net: internal network isolating backend tool servers.
+
+services:
+  # 1. MCP Cognitive Sidecar (Evaluator & Policy Enforcement)
+  ilp-sidecar:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ilp-core:latest
+    container_name: ilp_mcp_sidecar
+    command:
+      - "--listen"
+      - "0.0.0.0:9001"
+      - "--gateway"
+      - "ilp-gateway:9002"
+      - "--policy"
+      - "/etc/ilp/policies/default_msac.conf"
+      - "--psk-file"
+      - "/run/secrets/ilp_psk_key"
+      - "--audit-log"
+      - "/var/log/ilp/sidecar_audit.jsonl"
+      - "--allow-non-loopback"
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    networks:
+      - agent_sandbox_net
+      - ilp_backbone_net
+    volumes:
+      - ../policies:/etc/ilp/policies:ro
+      - sidecar_audit_data:/var/log/ilp
+    secrets:
+      - source: ilp_psk_key
+        target: /run/secrets/ilp_psk_key
+        mode: 0400
+        uid: "10001"
+        gid: "10001"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+
+  # 2. MCP Gateway Daemon (Binary I-PDU Ingress & Tool Dispatcher)
+  ilp-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ilp-core:latest
+    container_name: ilp_mcp_gateway
+    entrypoint: ["/usr/local/bin/ilp_mcp_gateway"]
+    command:
+      - "--listen"
+      - "0.0.0.0:9002"
+      - "--backend"
+      - "tool-server:8080"
+      - "--psk-file"
+      - "/run/secrets/ilp_psk_key"
+      - "--psk-previous-file"
+      - "/run/secrets/ilp_psk_previous_key"
+      - "--audit-log"
+      - "/var/log/ilp/gateway_audit.jsonl"
+      - "--allow-non-loopback"
+      - "--max-conns"
+      - "128"
+    user: "10001:10001"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    networks:
+      - ilp_backbone_net
+      - tools_backend_net
+    volumes:
+      - gateway_audit_data:/var/log/ilp
+    secrets:
+      - source: ilp_psk_key
+        target: /run/secrets/ilp_psk_key
+        mode: 0400
+        uid: "10001"
+        gid: "10001"
+      - source: ilp_psk_previous_key
+        target: /run/secrets/ilp_psk_previous_key
+        mode: 0400
+        uid: "10001"
+        gid: "10001"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+
+networks:
+  # Internal: Strictly air-gapped from internet; prevents Agent exfiltration bypassing sidecar
+  agent_sandbox_net:
+    driver: bridge
+    internal: true
+
+  # Inter-daemon binary I-PDU transport network
+  ilp_backbone_net:
+    driver: bridge
+    internal: true
+
+  # Backend tools network
+  tools_backend_net:
+    driver: bridge
+    internal: true
+
+volumes:
+  sidecar_audit_data:
+    driver: local
+  gateway_audit_data:
+    driver: local
+
+secrets:
+  ilp_psk_key:
+    file: ../tests/fixtures/psk_primary.key
+  ilp_psk_previous_key:
+    file: ../tests/fixtures/psk_previous.key

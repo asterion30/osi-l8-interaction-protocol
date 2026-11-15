@@ -44,6 +44,8 @@ pub struct UserGovernancePolicy {
     pub blacklisted_skills: HashSet<u64>,
     /// Lista blanca opcional de habilidades autorizadas (si está presente, solo estas pasan).
     pub whitelisted_skills: Option<HashSet<u64>>,
+    /// Lista de patrones o subcadenas personalizadas para bloqueo DLP en Paso 3.
+    pub custom_dlp_deny_patterns: Vec<String>,
 }
 
 impl Default for UserGovernancePolicy {
@@ -57,6 +59,7 @@ impl Default for UserGovernancePolicy {
             deny_external_egress_if_tainted: true,
             blacklisted_skills: HashSet::new(),
             whitelisted_skills: None,
+            custom_dlp_deny_patterns: Vec::new(),
         }
     }
 }
@@ -144,7 +147,11 @@ impl UserGovernancePolicy {
                 });
             }
 
-            if key != "blacklist_skill" && key != "whitelist_skill" && !seen_keys.insert(key) {
+            if key != "blacklist_skill"
+                && key != "whitelist_skill"
+                && key != "custom_dlp_deny_pattern"
+                && !seen_keys.insert(key)
+            {
                 return Err(PolicyParseError {
                     line_number,
                     message: format!("Clave duplicada no permitida: '{}'", key),
@@ -223,6 +230,15 @@ impl UserGovernancePolicy {
                     let set = policy.whitelisted_skills.get_or_insert_with(HashSet::new);
                     set.insert(hash);
                 }
+                "custom_dlp_deny_pattern" => {
+                    if value.is_empty() {
+                        return Err(PolicyParseError {
+                            line_number,
+                            message: "custom_dlp_deny_pattern no puede estar vacío".to_string(),
+                        });
+                    }
+                    policy.custom_dlp_deny_patterns.push(value.to_string());
+                }
                 unknown => {
                     return Err(PolicyParseError {
                         line_number,
@@ -264,6 +280,10 @@ impl UserGovernancePolicy {
             for hash in sorted_whitelist {
                 out.push_str(&format!("whitelist_skill = 0x{:016X}\n", hash));
             }
+        }
+
+        for pattern in &self.custom_dlp_deny_patterns {
+            out.push_str(&format!("custom_dlp_deny_pattern = {}\n", pattern));
         }
 
         out

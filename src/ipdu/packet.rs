@@ -92,6 +92,24 @@ impl IpduPacket {
         &self.payload
     }
 
+    /// Retorna una referencia mutable al payload del paquete (para cifrado/descifrado in-place).
+    #[inline]
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        &mut self.payload
+    }
+
+    /// Retorna una referencia mutable a la cabecera del paquete.
+    #[inline]
+    pub fn header_mut(&mut self) -> &mut IpduHeader {
+        &mut self.header
+    }
+
+    /// Actualiza los flags de política cognitiva en la cabecera del paquete.
+    #[inline]
+    pub fn set_policy_flags(&mut self, flags: CognitivePolicyFlags) {
+        self.header.policy_flags = flags;
+    }
+
     /// Descompone el paquete consumiéndolo en su cabecera y payload.
     #[inline]
     pub fn into_parts(self) -> (IpduHeader, Vec<u8>) {

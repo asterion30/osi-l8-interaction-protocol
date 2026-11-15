@@ -14,5 +14,5 @@ pub use mcp_adapter::{McpRpcRequest, McpRpcResponse, McpSessionCorrelationTable}
 pub use proxy::{
     read_bounded_line_with_deadline, ClientIngressResult, ConnectionPermit, GatewayConfig,
     IlpMcpGateway, McpGatewayServer, McpProxyRelay, McpSidecarServer, ProxyError, ReplayGuard,
-    SidecarConfig,
+    ServerMetrics, ServerMetricsSnapshot, SidecarConfig,
 };

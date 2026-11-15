@@ -20,11 +20,15 @@ fn print_help() {
           --timeout-ms <MS>          Tiempo límite para operaciones de E/S en milisegundos (default: 5000)\n  \
           --psk-file <RUTA>          Carga clave pre-compartida de 128 bits desde archivo (requiere permisos 0600 o 0400)\n  \
           --psk <HEX_KEY>            [DEPRECATED/TEST-ONLY] Clave pre-compartida en línea de comandos (visible en /proc)\n  \
+          --psk-previous-file <RUTA> Carga clave PSK previa para rotación sin interrupciones (Zero-Downtime Key Rotation)\n  \
+          --psk-previous <HEX_KEY>   [TEST-ONLY] Clave PSK previa en hexadecimal (32 caracteres)\n  \
+          --audit-log <RUTA>         Ruta para archivo de log forense estructurado en formato JSONL para SIEM\n  \
           --allow-non-loopback       Permite enlazar a interfaces de red externas (requiere PSK)\n  \
           --check-config             Valida la configuración y sale con código 0\n  \
           -h, --help                 Muestra esta ayuda y finaliza\n\n\
         Variables de entorno:\n  \
-          ILP_PSK_HEX                Clave pre-compartida de 128 bits (32 dígitos hexadecimales)\n"
+          ILP_PSK_HEX                Clave pre-compartida de 128 bits (32 dígitos hexadecimales)\n  \
+          ILP_PSK_PREVIOUS_HEX       Clave pre-compartida previa para rotación de claves en caliente\n"
     );
 }
 
@@ -65,6 +69,32 @@ fn load_psk(psk_file: Option<&str>, psk_hex: Option<&str>) -> Result<Option<[u8;
 }
 
 #[cfg(feature = "mcp")]
+fn load_previous_psk(
+    psk_file: Option<&str>,
+    psk_hex: Option<&str>,
+) -> Result<Option<[u8; 16]>, String> {
+    if let Some(path) = psk_file {
+        let key = load_psk_from_file_secure(path)?;
+        return Ok(Some(key));
+    }
+
+    if let Ok(env_val) = std::env::var("ILP_PSK_PREVIOUS_HEX") {
+        let trimmed = env_val.trim();
+        if !trimmed.is_empty() {
+            let key = parse_hex_psk(trimmed)?;
+            return Ok(Some(key));
+        }
+    }
+
+    if let Some(hex_key) = psk_hex {
+        let key = parse_hex_psk(hex_key)?;
+        return Ok(Some(key));
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "mcp")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -74,6 +104,9 @@ fn main() {
     let mut timeout_ms = 5000u64;
     let mut psk_str: Option<String> = None;
     let mut psk_file_path: Option<String> = None;
+    let mut psk_previous_str: Option<String> = None;
+    let mut psk_previous_file_path: Option<String> = None;
+    let mut audit_log_path: Option<String> = None;
     let mut allow_non_loopback = false;
     let mut check_config_only = false;
 
@@ -90,6 +123,48 @@ fn main() {
             }
             "--allow-non-loopback" => {
                 allow_non_loopback = true;
+                i += 1;
+            }
+            "--psk-previous-file" => {
+                if i + 1 < args.len() {
+                    psk_previous_file_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --psk-previous-file requiere una ruta de archivo");
+                    std::process::exit(1);
+                }
+            }
+            opt if opt.starts_with("--psk-previous-file=") => {
+                psk_previous_file_path =
+                    Some(opt.trim_start_matches("--psk-previous-file=").to_string());
+                i += 1;
+            }
+            "--psk-previous" => {
+                if i + 1 < args.len() {
+                    psk_previous_str = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!(
+                        "Error: --psk-previous requiere una clave hexadecimal de 32 caracteres"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            opt if opt.starts_with("--psk-previous=") => {
+                psk_previous_str = Some(opt.trim_start_matches("--psk-previous=").to_string());
+                i += 1;
+            }
+            "--audit-log" => {
+                if i + 1 < args.len() {
+                    audit_log_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --audit-log requiere una ruta de archivo");
+                    std::process::exit(1);
+                }
+            }
+            opt if opt.starts_with("--audit-log=") => {
+                audit_log_path = Some(opt.trim_start_matches("--audit-log=").to_string());
                 i += 1;
             }
             "--listen" => {
@@ -224,6 +299,18 @@ fn main() {
         }
     };
 
+    // Cargar PSK previa para rotación sin downtime (Zero-Downtime Key Rotation)
+    let parsed_psk_previous = match load_previous_psk(
+        psk_previous_file_path.as_deref(),
+        psk_previous_str.as_deref(),
+    ) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("Error de clave PSK previa: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Guardarraíl de seguridad para interfaces de red no-loopback
     if !listen_addr.ip().is_loopback() && (!allow_non_loopback || parsed_psk.is_none()) {
         eprintln!(
@@ -247,6 +334,14 @@ fn main() {
                 "Deshabilitada"
             }
         );
+        println!(
+            "  - Dual-PSK:        {}",
+            if parsed_psk_previous.is_some() {
+                "Habilitada (Rotación sin downtime)"
+            } else {
+                "Inactiva"
+            }
+        );
         std::process::exit(0);
     }
 
@@ -265,11 +360,16 @@ fn main() {
             "Inactiva (Dev Mode)"
         }
     );
+    if parsed_psk_previous.is_some() {
+        println!("• Dual-PSK Rotación:     Activa (Clave previa registrada)");
+    }
 
     let config = GatewayConfig {
         max_concurrent_connections: max_conns,
         io_timeout: Duration::from_millis(timeout_ms),
         psk: parsed_psk,
+        psk_previous: parsed_psk_previous,
+        audit_log_path,
         ..Default::default()
     };
 

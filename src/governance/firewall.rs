@@ -100,6 +100,47 @@ pub struct AuditRecord {
     pub step_failed: Option<u8>,
 }
 
+impl AuditRecord {
+    /// Serializa el registro de auditoría a una línea de texto JSON válida (formato JSONL para SIEM).
+    pub fn to_jsonl_line(&self, component: &str) -> String {
+        let verdict_str = match self.verdict {
+            Verdict::Allow => "ALLOW",
+            Verdict::Drop => "DROP",
+        };
+        let err_code_val = match self.error_code {
+            Some(ec) => format!("{}", ec.as_i32()),
+            None => "null".to_string(),
+        };
+        let step_val = match self.step_failed {
+            Some(s) => format!("{}", s),
+            None => "null".to_string(),
+        };
+        let escaped_reason = self
+            .reason
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+        let escaped_agent = self.agent_name.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_perf = self.performative.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_comp = component.replace('\\', "\\\\").replace('"', "\\\"");
+
+        format!(
+            "{{\"timestamp_ms\":{},\"component\":\"{}\",\"session_uuid\":{},\"pid\":{},\"agent_name\":\"{}\",\"performative\":\"{}\",\"verdict\":\"{}\",\"error_code\":{},\"step_failed\":{},\"reason\":\"{}\"}}\n",
+            self.timestamp_ms,
+            escaped_comp,
+            self.session_uuid,
+            self.pid,
+            escaped_agent,
+            escaped_perf,
+            verdict_str,
+            err_code_val,
+            step_val,
+            escaped_reason
+        )
+    }
+}
+
 /// Decisión resultante del análisis del filtro MSAC.
 #[derive(Debug, Clone)]
 pub struct FilterDecision {
@@ -301,7 +342,10 @@ impl CognitiveFirewall {
         // =========================================================================
         // PASO 3: Guardián SLM Embebido: Inspección Profunda de Carga Útil (<5 ms)
         // =========================================================================
-        if let Err(threat) = self.gatekeeper.inspect(packet.payload()) {
+        if let Err(threat) = self
+            .gatekeeper
+            .inspect_with_custom_patterns(packet.payload(), &self.policy.custom_dlp_deny_patterns)
+        {
             let (err_code, reason) = match threat {
                 GatekeeperThreat::FinancialExfiltration(msg) => {
                     (CognitiveErrorCode::EpermSemanticExfiltration, msg)
@@ -316,6 +360,9 @@ impl CognitiveFirewall {
                     (CognitiveErrorCode::EpermPromptInjection, msg)
                 }
                 GatekeeperThreat::InvalidUtf8Encoding(msg) => {
+                    (CognitiveErrorCode::EpermSemanticExfiltration, msg)
+                }
+                GatekeeperThreat::CustomPatternMatch(msg) => {
                     (CognitiveErrorCode::EpermSemanticExfiltration, msg)
                 }
             };

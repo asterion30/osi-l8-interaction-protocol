@@ -55,7 +55,7 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 # Compilar la biblioteca y binarios
 cargo build --locked
 
-# Ejecutar la suite completa de tests unitarios y de integración (70 tests)
+# Ejecutar la suite completa de tests unitarios y de integración (79 tests)
 cargo test --locked --all-targets --all-features
 
 # Auditar y verificar el conteo formal de pruebas
@@ -238,6 +238,18 @@ Para impedir la inyección directa de tramas I-PDU espurias contra el Gateway, a
   1. `--psk-file <PATH>`: Carga la clave desde un archivo protegido con permisos estrictos de Unix (`0600` o `0400`, accesible solo por el propietario). Rechaza explícitamente enlaces simbólicos (*symlinks*) y valida los permisos en el descriptor abierto (`fstat`) libre de TOCTOU con lectura acotada a 256 bytes.
   2. `ILP_PSK_HEX`: Variable de entorno con la clave en hexadecimal (32 caracteres).
   3. `--psk <HEX_KEY>`: [DEPRECATED / TEST-ONLY] Argumento en línea de comandos (emite advertencia de seguridad debido a su visibilidad en `/proc` y `ps`).
+- **Cifrado de Flujo en Tránsito ChaCha20 (RFC 8439) y Encrypt-then-MAC**:
+  - Implementado en Rust puro (`std`-only, 0 dependencias externas).
+  - El Sidecar cifra el payload JSON-RPC con ChaCha20, activa el flag `CognitivePolicyFlags::ENCRYPTED_PAYLOAD` en la cabecera canónica I-PDU, y calcula el MAC SipHash-2-4 sobre la cabecera + ciphertext (*Encrypt-then-MAC*).
+  - La clave ChaCha20 se deriva vía KDF determinista desde la PSK (`"ILP-ChaCha20-Payload-Key-Derivation"`).
+  - Los nonces se derivan por sesión con separación estricta de dominios: bit 63 en `0` para peticiones (`is_response = false`), bit 63 en `1` para respuestas (`is_response = true`), garantizando que jamás se reutilice un nonce con la misma clave.
+  - Habilitado por defecto (`--encrypt-payload`). Puede desactivarse explícitamente para pruebas con `--no-encrypt-payload`.
+- **Rotación de Claves en Caliente sin Caídas (Zero-Downtime Dual-PSK)**:
+  - El Gateway admite una clave previa (`--psk-previous-file <PATH>`, `--psk-previous <HEX>` o `ILP_PSK_PREVIOUS_HEX`).
+  - Durante ventanas de migración de credenciales, el Gateway acepta tramas firmadas/cifradas con la clave primaria O con la clave anterior, incrementando la métrica atómica `key_rotations_accepted`.
+  - La respuesta se cifra y autentica con la misma clave con la que la petición fue verificada, eliminando tiempos de inactividad durante despliegues progresivos de Sidecars.
+- **Volcado Forense Estructurado JSONL para SIEM (`--audit-log <PATH>`)**:
+  - Tanto `ilp_mcp_sidecar` como `ilp_mcp_gateway` permiten exportar cada evento de auditoría en tiempo real en formato JSONL delimitado por saltos de línea (`\n`), listo para ingesta por Wazuh, ElasticSearch/Logstash o Splunk.
 - **Invariante Verify-Then-Parse**: El Gateway recibe la trama cruda y valida el MAC antes de invocar cualquier deserializador JSON-RPC. Si la firma es inválida, se devuelve de inmediato `Performative::RejectPolicy` con código `-32001` sin procesar el contenido de la carga útil.
 - **Protección Anti-Replay Fail-Closed (`ReplayGuard`)**: El Gateway mantiene un registro acotado de `session_uuid` observados con ventana temporal de 60 segundos y capacidad máxima de 4096 entradas (el `session_uuid` es único por dominio de clave PSK e instancia de Gateway). Cualquier trama retransmitida con UUID duplicado es descartada con error `-32003` ("Replay attack detected"). Bajo saturación de la tabla sin entradas expiradas, opera bajo política **Fail-Closed**: rechaza nuevas conexiones con error `-32003` ("Gateway replay protection table saturated; try again later") sin desalojar jamás entradas vigentes.
 - **Aislamiento de Tinte por Conexión**: Cada cliente que se conecta al Sidecar opera sobre una copia aislada del contexto de tinte. Los datos sensibles detectados en respuestas de herramientas o claims explícitos solo afectan a esa conexión específica, garantizando que un cliente manchado no contamine a otros clientes.
@@ -248,8 +260,8 @@ Para impedir la inyección directa de tramas I-PDU espurias contra el Gateway, a
 
 El proyecto provee dos binarios de línea de comandos independientes:
 
-- **`ilp_mcp_sidecar`**: Intercepta tráfico JSON-RPC del agente, audita con MSAC (Zero-Connect: jamás abre TCP al gateway si la política rechaza), auto-mancha dinámicamente el proceso ante respuestas con datos sensibles (`DLP Ingress`), firma tramas con PSK y maneja concurrencia atómica (CAS) sin condiciones de carrera.
-- **`ilp_mcp_gateway`**: Recibe paquetes binarios I-PDU del sidecar sobre `IlpStream`, ejecuta Verify-Then-Parse y filtrado anti-replay, despacha JSON-RPC al backend de herramientas MCP y propaga errores estructurados (`-32002`) si el backend está inalcanzable.
+- **`ilp_mcp_sidecar`**: Intercepta tráfico JSON-RPC del agente, audita con MSAC (Zero-Connect: jamás abre TCP al gateway si la política rechaza), auto-mancha dinámicamente el proceso ante respuestas con datos sensibles (`DLP Ingress`), cifra payloads con ChaCha20 (RFC 8439), firma tramas con PSK SipHash-2-4 y maneja concurrencia atómica (CAS) sin condiciones de carrera. Soporta `--audit-log <PATH>`.
+- **`ilp_mcp_gateway`**: Recibe paquetes binarios I-PDU del sidecar sobre `IlpStream`, ejecuta Verify-Then-Parse con soporte Dual-PSK, descifra el payload ChaCha20, filtra con anti-replay fail-closed, despacha JSON-RPC al backend de herramientas MCP y propaga errores estructurados (`-32002`) si el backend está inalcanzable. Soporta `--audit-log <PATH>`.
 
 ```bash
 # Validar sintaxis y configuración sin iniciar los servidores (--check-config)
@@ -364,10 +376,11 @@ Para desplegar la arquitectura de Capa 8 en entornos de misión crítica, seguir
    - Prohibir terminantemente el uso de enlaces simbólicos (`symlink`) y enlaces duros (`hardlink`) para prevenir ataques TOCTOU y accesos compartidos fuera del control del daemon.
    - El daemon valida atómicamente en Linux/POSIX mediante `MetadataExt` que `symlink_metadata().dev() == file.metadata().dev()`, `ino() == ino()` y `nlink() == 1`.
 
-2. **Rotación de Claves sin Tiempo de Inactividad (Zero-Downtime Rotation)**:
-   - Desplegar una instancia secundaria de Gateway en un puerto paralelo con la nueva clave PSK.
-   - Actualizar gradualmente los Sidecars apuntando a la nueva instancia.
-   - Apagar ordenadamente la instancia de Gateway anterior mediante `McpGatewayServer::shutdown()` asegurando que se drenen todas las transacciones en vuelo.
+2. **Rotación de Claves sin Tiempo de Inactividad (Zero-Downtime Dual-PSK)**:
+   - Configurar en el Gateway la nueva clave como principal (`--psk-file`) y la clave saliente como `--psk-previous-file` (o variables `ILP_PSK_HEX` e `ILP_PSK_PREVIOUS_HEX`).
+   - El Gateway acepta instantáneamente ambas claves sin requerir puertos paralelos ni ventanas de indisponibilidad.
+   - Migrar progresivamente los Sidecars a la nueva clave.
+   - Una vez migrados todos los clientes (verificado mediante la métrica `key_rotations_accepted` en el Gateway), retirar `--psk-previous-file`.
 
 3. **Apagado Ordenado y Drenaje de Conexiones (Graceful Shutdown)**:
    - Configurar `drain_timeout` en `SidecarConfig` y `GatewayConfig` (valor por defecto recomendado: `2000 ms`).
@@ -375,13 +388,68 @@ Para desplegar la arquitectura de Capa 8 en entornos de misión crítica, seguir
 
 4. **Aislamiento de Red y Perímetro Restringido**:
    - Por defecto, los daemons se niegan a escuchar en interfaces no-loopback (`0.0.0.0`) a menos que se especifique explícitamente `--allow-non-loopback` y una clave `--psk-file` válida.
-   - Para despliegues inter-servidor, tunelizar el tráfico I-PDU sobre mTLS o túneles de red WireGuard dedicados y restringir el puerto mediante `iptables` / `nftables` a nivel de namespace de red (`netns`).
+   - El payload viaja cifrado en tránsito de extremo a extremo con ChaCha20 (RFC 8439) y autenticado con SipHash-2-4 (*Encrypt-then-MAC*). Para aislamiento adicional, aislar los daemons mediante topología de red restringida en Docker (`internal: true`) o namespaces de Linux.
 
 5. **Protección Anti-Replay y Política Fail-Closed bajo Carga**:
    - Dimensionar la ventana temporal de `ReplayGuard` (`window_ttl = 60s`, `max_entries = 4096`).
-   - Bajo ráfagas extremas que saturen la tabla de memoria, el Gateway aplica política *Fail-Closed*: rechaza solicitudes adicionales con error `-32000` en lugar de expulsar entradas vigentes, preservando la garantía absoluta de no-repetición.
+   - Bajo ráfagas extremas que saturen la tabla de memoria, el Gateway aplica política *Fail-Closed*: rechaza solicitudes adicionales con error `-32003` en lugar de expulsar entradas vigentes, preservando la garantía absoluta de no-repetición.
 
-6. **Monitoreo y Auditoría de Tinte en Tiempo Real**:
-   - Integrar un colector de logs que consuma periódicamente el ring buffer `CognitiveFirewall::audit_log()`.
-   - Alertar inmediatamente ante eventos con `FilterDecision::Drop`, especialmente códigos `EPERM_COGNITIVE_POLICY` (intento de exfiltración de PII o credenciales) y `EPERM_PROMPT_INJECTION`.
+6. **Monitoreo y Auditoría de Tinte en Tiempo Real (SIEM)**:
+   - Habilitar el flag `--audit-log /var/log/ilp/audit.jsonl` en los daemons para volcar cada evento forense a un archivo JSONL en streaming.
+   - Configurar el agente SIEM (Wazuh, Elastic Filebeat, FluentBit) para monitorizar `/var/log/ilp/audit.jsonl`.
+   - Alertar inmediatamente ante eventos con `"decision":"Drop"`, especialmente códigos `EPERM_COGNITIVE_POLICY` (intento de exfiltración de PII o credenciales), `EPERM_PROMPT_INJECTION` y `EPERM_SEMANTIC_EXFILTRATION`.
+
+---
+
+## 8. Infraestructura de Despliegue en Producción (`deploy/`)
+
+El repositorio provee infraestructura lista para producción en el directorio [`deploy/`](../deploy/):
+
+### 1. Contenedor Docker Multi-Stage (`deploy/Dockerfile`)
+- Construcción optimizada en 2 etapas: `cargo build --release --locked` sobre toolchain oficial de Rust, copiado a runtime minimalista sobre `debian:bookworm-slim`.
+- Usuario sin privilegios dedicado: `UID 10001:GID 10001` (`ilp`), sin acceso `root` ni `sudo`.
+- Directorio de auditoría `/var/log/ilp` con permisos exclusivos `0750`.
+- Compilación:
+  ```bash
+  docker build -f deploy/Dockerfile -t ilp-core:latest .
+  ```
+
+### 2. Orquestación Segregada (`deploy/docker-compose.isolated.yml`)
+Define una topología de tres redes aisladas:
+1. `agent_sandbox_net`: Red interna (`internal: true`) sin puerta de enlace hacia internet público. El agente agéntico reside aquí y solo tiene visibilidad hacia el puerto del Sidecar (`127.0.0.1:9001` o IP de red).
+2. `ilp_backbone_net`: Red interna punto a punto entre Sidecar y Gateway para el túnel binario I-PDU (cifrado con ChaCha20 y firmado con SipHash-2-4).
+3. `tools_backend_net`: Red donde reside el servidor de herramientas MCP backend y el Gateway.
+- Carga de secretos PSK mediante Docker Secrets con permisos `0400`.
+- Límites de recursos estrictos (`limits: cpus: '1.0'`, `memory: 128M`).
+
+Ejecución:
+```bash
+# Crear claves secretas de ejemplo
+mkdir -p deploy/secrets
+openssl rand -hex 16 > deploy/secrets/ilp_psk.key
+chmod 0400 deploy/secrets/ilp_psk.key
+
+docker compose -f deploy/docker-compose.isolated.yml up -d
+```
+
+### 3. Servicios Hardened para Linux (`deploy/systemd/`)
+Para despliegues nativos sobre Linux sin contenedores, se incluyen unidades de servicio con aislamiento estricto del kernel:
+- `deploy/systemd/ilp-mcp-sidecar.service`
+- `deploy/systemd/ilp-mcp-gateway.service`
+
+Directivas de endurecimiento aplicadas:
+- `User=ilp`, `Group=ilp`
+- `ProtectSystem=strict`, `ProtectHome=true`
+- `NoNewPrivileges=true`, `PrivateTmp=true`, `PrivateDevices=true`
+- `ProtectKernelTunables=true`, `ProtectKernelModules=true`, `ProtectControlGroups=true`
+- `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`
+- `CapabilityBoundingSet=` (cero capacidades Linux permitidas)
+- `MemoryMax=256M`, `TasksMax=64`
+
+### 4. Formato de Eventos Forenses SIEM (JSON Lines)
+Cada registro escrito en `--audit-log` genera una línea JSON válida:
+```json
+{"timestamp_epoch_secs":1731638400,"component":"Sidecar","decision":"Drop","reason":"EpermSemanticExfiltration","session_uuid":84920481239,"taint_bitmask":4,"taint_labels":["FinancialPii"],"taint_sources":["file:/data/payments.csv"],"payload_len":184}
+```
+Listo para ser parseado e indexado automáticamente por Wazuh, Datadog o Elasticsearch sin necesidad de expresiones regulares complejas.
 

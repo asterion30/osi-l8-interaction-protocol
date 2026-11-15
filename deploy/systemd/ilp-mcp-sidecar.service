@@ -1,0 +1,44 @@
+[Unit]
+Description=ILP MCP Sidecar Daemon - Capa 8 (RFC-ILP-2026)
+Documentation=https://github.com/asterion30/osi-l8-interaction-protocol
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ilp
+Group=ilp
+WorkingDirectory=/etc/ilp
+ExecStart=/usr/local/bin/ilp_mcp_sidecar \
+    --listen 127.0.0.1:9001 \
+    --gateway 127.0.0.1:9002 \
+    --policy /etc/ilp/policies/default_msac.conf \
+    --psk-file /etc/ilp/secrets/psk.key \
+    --audit-log /var/log/ilp/sidecar_audit.jsonl
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=10s
+
+# Linux Kernel Hardening & Sandbox Directives
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=true
+PrivateDevices=true
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Logging & File Permissions
+ReadWritePaths=/var/log/ilp
+ReadOnlyPaths=/etc/ilp
+
+[Install]
+WantedBy=multi-user.target

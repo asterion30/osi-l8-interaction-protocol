@@ -19,11 +19,13 @@ Para proporcionar total transparencia a auditores de seguridad, ingenieros de si
 | Componente del Protocolo | Estado de Madurez | Ubicación en el Repositorio |
 | :--- | :---: | :--- |
 | **Binary I-PDU Wire Framing (32B/36B)** | ✅ **Implemented & Fuzz-Tested** | [`src/ipdu/`](src/ipdu/) (Header, Packet, Word 0, Length-Prefix, TrailingBytes check) |
-| **Userspace MSAC Semantic Firewall** | ✅ **Implemented & Auditable** | [`src/governance/`](src/governance/) (Pipeline de 3 pasos, Ring Buffer, HeuristicGatekeeper) |
+| **Pure Rust ChaCha20 Payload Encryption (RFC 8439)** | ✅ **Implemented & Test-Vector Verified** | [`src/ipdu/crypto.rs`](src/ipdu/crypto.rs) (Pure `std` ARX cipher, Encrypt-then-MAC, disjoint session nonces) |
+| **Userspace MSAC Semantic Firewall** | ✅ **Implemented & Auditable** | [`src/governance/`](src/governance/) (Pipeline de 3 pasos, Ring Buffer, HeuristicGatekeeper, Custom DLP) |
 | **Monotonic Taint Tracking & Origin Traceability** | ✅ **Implemented** | [`src/governance/taint.rs`](src/governance/taint.rs) (`TaintEvent`, `source_descriptor`, private fields) |
-| **Zero-Deps Policy Engine (`.conf`)** | ✅ **Implemented** | [`src/governance/policy.rs`](src/governance/policy.rs), [`policies/default_msac.conf`](policies/default_msac.conf) |
+| **Zero-Deps Policy Engine (`.conf`)** | ✅ **Implemented** | [`src/governance/policy.rs`](src/governance/policy.rs), [`policies/default_msac.conf`](policies/default_msac.conf) (con `custom_dlp_deny_pattern`) |
 | **Stateful TCP Transport & 3-Way Handshake FSM** | ✅ **Implemented** | [`src/transport/`](src/transport/) (`SessionRole::Initiator` vs `Responder`, atomic mutation) |
-| **MCP (JSON-RPC) Shield Adapter & E2E Proxy** | ✅ **Implemented (Deployable Sidecar & Gateway Binaries with PSK Auth, Anti-Replay & Auto-Taint)** | [`src/bridge/`](src/bridge/), [`tests/test_mcp_proxy_e2e.rs`](tests/test_mcp_proxy_e2e.rs), [`src/bin/`](src/bin/) (Sidecar & Gateway autónomos con autenticación PSK, fail-closed anti-replay y prueba Zero-Connect) |
+| **MCP (JSON-RPC) Shield Adapter & E2E Proxy** | ✅ **Implemented (Deployable Sidecar & Gateway Binaries)** | [`src/bridge/`](src/bridge/), [`tests/test_mcp_proxy_e2e.rs`](tests/test_mcp_proxy_e2e.rs), [`src/bin/`](src/bin/) (Dual-PSK zero-downtime, CSPRNG, Anti-Replay fail-closed, SIEM JSONL) |
+| **Production Deployment Assets (Docker & Systemd)** | ✅ **Implemented & Hardened** | [`deploy/`](deploy/) (Multi-stage unprivileged Dockerfile UID 10001, isolated Compose, systemd units) |
 | **Linux Kernel eBPF / LSM Socket Hooks** | 🗺️ **Architectural Specification (Roadmap)** | [`docs/ARCHITECTURE_SPEC.md`](docs/ARCHITECTURE_SPEC.md) (Fase 4 del estándar) |
 
 ---
@@ -78,7 +80,7 @@ El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento
 ## 🚀 Inicio Rápido (Quickstart)
 
 ```bash
-# 1. Ejecutar la suite completa de 70 pruebas de integración y unitarias
+# 1. Ejecutar la suite completa de 79 pruebas de integración y unitarias
 cargo test --locked --all-targets --all-features
 
 # 2. Auditar formalmente el conteo de pruebas por componente
@@ -235,10 +237,17 @@ osi-l8-interaction-protocol/
 ├── Cargo.toml                                            # Definición de crate ilp-core (zero-deps por defecto)
 ├── LICENSE                                               # Licencia de código MIT
 ├── LICENSE-DOCS                                          # Licencia de documentación CC BY 4.0
+├── deploy/                                               # Infraestructura de despliegue contenerizado y hardened
+│   ├── Dockerfile                                        # Multi-stage build no-root UID 10001 (debian:bookworm-slim)
+│   ├── docker-compose.isolated.yml                       # Red segregada con sandbox interna (internal: true)
+│   └── systemd/                                          # Unidades hardened con sandboxing estricto de Linux
+│       ├── ilp-mcp-sidecar.service                       # Daemon Sidecar protegido
+│       └── ilp-mcp-gateway.service                       # Daemon Gateway protegido
 ├── policies/
 │   └── default_msac.conf                                 # Archivo de políticas declarativas de ejemplo
 ├── scripts/
-│   └── run_benchmarks.sh                                 # Script de benchmark estadístico reproducible
+│   ├── run_benchmarks.sh                                 # Script de benchmark estadístico reproducible
+│   └── verify_test_count.sh                              # Verificación automatizada de tests unitarios y E2E
 ├── docs/
 │   ├── ARCHITECTURE_SPEC.md                              # Especificación teórica OSI L8 y roadmap eBPF/LSM
 │   ├── BENCHMARK_RESULTS.md                              # Resultados empíricos de benchmark (p50/p95/p99)
@@ -250,28 +259,29 @@ osi-l8-interaction-protocol/
 │   │   ├── performatives.rs                              # Speech acts (Discover, Propose, Commit, Attest, Reject)
 │   │   ├── header.rs                                     # IpduHeader e IpduError
 │   │   ├── packet.rs                                     # IpduPacket y Length-Prefix bounds checking
-│   │   └── auth.rs                                       # Autenticación de integridad SipHash-2-4 con PSK 128-bit
+│   │   ├── auth.rs                                       # Autenticación de integridad SipHash-2-4 con PSK 128-bit
+│   │   └── crypto.rs                                     # Cifrado de flujo ChaCha20 (RFC 8439) en Rust puro std-only
 │   ├── governance/                                       # Firewall Cognitivo (MSAC / CRM)
 │   │   ├── taint.rs                                      # TaintTag, TaintEvent, ProcessTaintContext
-│   │   ├── policy.rs                                     # UserGovernancePolicy y parser .conf
-│   │   ├── gatekeeper.rs                                 # SLM Gatekeeper (DLP y prompt injection)
-│   │   └── firewall.rs                                   # CognitiveFirewall y Ring Buffer forense
+│   │   ├── policy.rs                                     # UserGovernancePolicy, custom DLP y parser .conf
+│   │   ├── gatekeeper.rs                                 # SLM Gatekeeper (DLP, custom regex/substrings y prompt injection)
+│   │   └── firewall.rs                                   # CognitiveFirewall, formato SIEM JSONL y Ring Buffer forense
 │   ├── transport/                                        # Capa de transporte y sesión con estado
 │   │   ├── mod.rs                                        # IlpStream sobre sockets TCP / Read+Write
 │   │   └── session.rs                                    # IlpSession y FSM de 3-Way Intent Handshake
 │   ├── bin/
 │   │   ├── ilp_mcp_sidecar.rs                            # Daemon autónomo CLI de producción MCP Sidecar
 │   │   └── ilp_mcp_gateway.rs                            # Daemon autónomo CLI de producción MCP Gateway
-│   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway)
+│   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway, Dual-PSK, ChaCha20)
 │   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 70 tests de integración y verificación E2E (100% pasando)
+├── tests/                                                # 79 tests de integración y verificación E2E (100% pasando)
 │   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking y simetría binaria (9 tests)
-│   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC (14 tests)
+│   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint, custom DLP y MSAC (16 tests)
 │   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (7 tests)
 │   ├── test_tcp_transport.rs                             # Sockets TCP reales y contención OOM (4 tests)
 │   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
 │   ├── test_mcp_bridge.rs                                # Mapeo estricto, correlación con TTL, purga e in-flight (11 tests)
-│   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: Zero-Connect, cota 64 KiB, Slowloris, PSK MAC, ReplayGuard fail-closed, graceful drain (14 tests)
+│   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: ChaCha20, Dual-PSK, JSONL SIEM, Slowloris, ReplayGuard (18 tests)
 │   └── test_cli_binaries.rs                              # Subprocess smoke tests CLI Gateway y Sidecar, rechazo de symlink/hardlink, PSK file/env (7 tests)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
@@ -280,8 +290,8 @@ osi-l8-interaction-protocol/
 ```
 
 > [!NOTE]
-> **Alcance del DLP Heurístico y Cifrado de Transporte:**
-> La inspección semántica y el auto-manchado por DLP (`HeuristicGatekeeper`) analizan cargas útiles en texto claro decodificado en el host. Para garantizar confidencialidad contra adversarios de red (man-in-the-middle), los túneles TCP entre Sidecar y Gateway deben combinarse con mTLS o VPN wire-level (WireGuard). La autenticación SipHash-2-4 de Capa 8 provee integridad de trama y autenticación de origen sin cifrado de contenido.
+> **Cifrado de Flujo en Tránsito ChaCha20 & Esquema Encrypt-then-MAC:**
+> El túnel binario de Capa 8 incorpora cifrado simétrico nativo en Rust puro (`std`-only, cero dependencias) basado en **ChaCha20 (RFC 8439)** acoplado al flag `CognitivePolicyFlags::ENCRYPTED_PAYLOAD`. Las cargas útiles se cifran con nonces derivados por sesión (con separación de dominios entre request y response) y se autentican mediante **SipHash-2-4 MAC** sobre la cabecera canónica y el texto cifrado (*Encrypt-then-MAC*), garantizando confidencialidad e integridad criptográfica en tránsito. Adicionalmente, el Gateway soporta rotación en caliente sin caídas (*Zero-Downtime Key Rotation*) aceptando simultáneamente la clave primaria y la previa (`psk_previous`).
 
 ---
 

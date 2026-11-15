@@ -48,7 +48,7 @@ if [ "$TOTAL_FAILED" -ne 0 ]; then
     exit 1
 fi
 
-EXPECTED_COUNT=70
+EXPECTED_COUNT=79
 if [ "$TOTAL_PASSED" -ne "$EXPECTED_COUNT" ]; then
     echo "ADVERTENCIA: Se esperaban $EXPECTED_COUNT pruebas, pero se contaron $TOTAL_PASSED."
 else

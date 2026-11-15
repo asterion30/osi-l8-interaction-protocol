@@ -396,3 +396,94 @@ fn test_all_sensitive_taint_tags_trigger_drop_on_external_egress() {
         assert_eq!(decision.step_failed, Some(1));
     }
 }
+
+#[test]
+fn test_custom_dlp_deny_pattern_from_conf() {
+    let conf_data = r#"
+user_did = did:key:z6MkhaXgBZDvotDkL5257faiz48xzpq2541
+max_budget_cap = 50000
+max_autonomy_tier = 3
+max_deadline_ms = 30000
+require_sandbox_above_tier = 2
+deny_external_egress_if_tainted = true
+custom_dlp_deny_pattern = INTERNAL_TOP_SECRET_CODENAME
+custom_dlp_deny_pattern = CONFIDENTIAL_PROJECT_X
+"#;
+
+    let policy = UserGovernancePolicy::from_conf_str(conf_data)
+        .expect("Debe parsear política con DLP personalizado");
+    assert_eq!(policy.custom_dlp_deny_patterns.len(), 2);
+    assert_eq!(
+        policy.custom_dlp_deny_patterns[0],
+        "INTERNAL_TOP_SECRET_CODENAME"
+    );
+    assert_eq!(policy.custom_dlp_deny_patterns[1], "CONFIDENTIAL_PROJECT_X");
+
+    let mut firewall = CognitiveFirewall::new(policy);
+    let proc = ProcessTaintContext::new(1234, "untainted-agent", true);
+
+    // Payload limpio: pasa
+    let clean_packet = IpduPacket::propose_intent(
+        0x1001,
+        0x2002,
+        1,
+        1000,
+        5000,
+        CognitivePolicyFlags::EMPTY,
+        0,
+        "status: operational",
+    )
+    .unwrap();
+    let decision = firewall.inspect_egress(&proc, &clean_packet);
+    assert_eq!(decision.verdict, Verdict::Allow);
+
+    // Payload con patrón denegado personalizado: bloqueado en Paso 3
+    let leaking_packet = IpduPacket::propose_intent(
+        0x1002,
+        0x2002,
+        1,
+        1000,
+        5000,
+        CognitivePolicyFlags::EMPTY,
+        0,
+        "exporting notes on INTERNAL_TOP_SECRET_CODENAME now",
+    )
+    .unwrap();
+    let decision = firewall.inspect_egress(&proc, &leaking_packet);
+    assert_eq!(decision.verdict, Verdict::Drop);
+    assert_eq!(
+        decision.error_code,
+        Some(CognitiveErrorCode::EpermSemanticExfiltration)
+    );
+    assert_eq!(decision.step_failed, Some(3));
+    assert!(decision
+        .reason
+        .unwrap()
+        .contains("INTERNAL_TOP_SECRET_CODENAME"));
+}
+
+#[test]
+fn test_audit_record_to_jsonl_line() {
+    let policy = build_clean_policy();
+    let mut firewall = CognitiveFirewall::new(policy);
+    let proc = ProcessTaintContext::new(777, "audit-agent", true);
+    let packet = IpduPacket::propose_intent(
+        0x5555,
+        0x6666,
+        1,
+        1000,
+        5000,
+        CognitivePolicyFlags::EMPTY,
+        0,
+        "hello world",
+    )
+    .unwrap();
+
+    let decision = firewall.inspect_egress(&proc, &packet);
+    let jsonl = decision.audit_record.to_jsonl_line("msac_firewall");
+    assert!(jsonl.ends_with('\n'));
+    assert!(jsonl.contains("\"component\":\"msac_firewall\""));
+    assert!(jsonl.contains("\"verdict\":\"ALLOW\""));
+    assert!(jsonl.contains("\"pid\":777"));
+    assert!(jsonl.contains("\"agent_name\":\"audit-agent\""));
+}

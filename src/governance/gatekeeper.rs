@@ -10,6 +10,7 @@ pub enum GatekeeperThreat {
     GovernmentIdLeak(String),
     PromptInjectionAttempt(String),
     InvalidUtf8Encoding(String),
+    CustomPatternMatch(String),
 }
 
 impl fmt::Display for GatekeeperThreat {
@@ -27,6 +28,9 @@ impl fmt::Display for GatekeeperThreat {
             }
             Self::InvalidUtf8Encoding(msg) => {
                 write!(f, "Codificación UTF-8 inválida en payload: {}", msg)
+            }
+            Self::CustomPatternMatch(msg) => {
+                write!(f, "Patrón DLP personalizado detectado: {}", msg)
             }
         }
     }
@@ -95,6 +99,37 @@ impl HeuristicGatekeeper {
             return Err(GatekeeperThreat::GovernmentIdLeak(
                 "Detectado prefijo de identificación ciudadana sensible".into(),
             ));
+        }
+
+        Ok(())
+    }
+
+    /// Analiza el payload aplicando los filtros estándar más una lista de patrones DLP personalizados denegados.
+    pub fn inspect_with_custom_patterns(
+        &self,
+        payload: &[u8],
+        custom_patterns: &[String],
+    ) -> Result<(), GatekeeperThreat> {
+        self.inspect(payload)?;
+
+        if custom_patterns.is_empty() || payload.is_empty() {
+            return Ok(());
+        }
+
+        let text = std::str::from_utf8(payload).map_err(|e| {
+            GatekeeperThreat::InvalidUtf8Encoding(format!(
+                "Secuencia UTF-8 malformada en payload semántico: {}",
+                e
+            ))
+        })?;
+
+        for pattern in custom_patterns {
+            if !pattern.is_empty() && text.contains(pattern.as_str()) {
+                return Err(GatekeeperThreat::CustomPatternMatch(format!(
+                    "Detectado patrón DLP denegado: '{}'",
+                    pattern
+                )));
+            }
         }
 
         Ok(())
