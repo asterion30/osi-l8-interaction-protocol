@@ -55,7 +55,7 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 # Compilar la biblioteca y binarios
 cargo build
 
-# Ejecutar la suite completa de tests unitarios y de integración (62 tests)
+# Ejecutar la suite completa de tests unitarios y de integración (65 tests)
 cargo test --all-targets --all-features
 
 # Comprobar análisis estático sin advertencias
@@ -232,11 +232,11 @@ En entornos con **Docker / Kubernetes**, se confina el runtime del agente en una
 
 Para impedir la inyección directa de tramas I-PDU espurias contra el Gateway, ambos daemons (`ilp_mcp_sidecar` e `ilp_mcp_gateway`) soportan autenticación de integridad basada en SipHash-2-4 con clave de 128 bits:
 - **Carga Segura de Clave (Prioridad de Carga)**:
-  1. `--psk-file <PATH>`: Carga la clave desde un archivo protegido con permisos estrictos de Unix (`0600` o `0400`, accesible solo por el propietario). Permisos más laxos son rechazados inmediatamente por seguridad.
+  1. `--psk-file <PATH>`: Carga la clave desde un archivo protegido con permisos estrictos de Unix (`0600` o `0400`, accesible solo por el propietario). Rechaza explícitamente enlaces simbólicos (*symlinks*) y valida los permisos en el descriptor abierto (`fstat`) libre de TOCTOU con lectura acotada a 256 bytes.
   2. `ILP_PSK_HEX`: Variable de entorno con la clave en hexadecimal (32 caracteres).
   3. `--psk <HEX_KEY>`: [DEPRECATED / TEST-ONLY] Argumento en línea de comandos (emite advertencia de seguridad debido a su visibilidad en `/proc` y `ps`).
 - **Invariante Verify-Then-Parse**: El Gateway recibe la trama cruda y valida el MAC antes de invocar cualquier deserializador JSON-RPC. Si la firma es inválida, se devuelve de inmediato `Performative::RejectPolicy` con código `-32001` sin procesar el contenido de la carga útil.
-- **Protección Anti-Replay (`ReplayGuard`)**: El Gateway mantiene un registro acotado de `session_uuid` observados con ventana temporal de 60 segundos y capacidad máxima de 4096 entradas. Cualquier trama retransmitida con UUID duplicado es descartada con error `-32003` ("Replay attack detected").
+- **Protección Anti-Replay Fail-Closed (`ReplayGuard`)**: El Gateway mantiene un registro acotado de `session_uuid` observados con ventana temporal de 60 segundos y capacidad máxima de 4096 entradas (el `session_uuid` es único por dominio de clave PSK e instancia de Gateway). Cualquier trama retransmitida con UUID duplicado es descartada con error `-32003` ("Replay attack detected"). Bajo saturación de la tabla sin entradas expiradas, opera bajo política **Fail-Closed**: rechaza nuevas conexiones con error `-32003` ("Gateway replay protection table saturated; try again later") sin desalojar jamás entradas vigentes.
 - **Aislamiento de Tinte por Conexión**: Cada cliente que se conecta al Sidecar opera sobre una copia aislada del contexto de tinte. Los datos sensibles detectados en respuestas de herramientas o claims explícitos solo afectan a esa conexión específica, garantizando que un cliente manchado no contamine a otros clientes.
 - **Control de Claims de Cliente (`--trust-client-claims`)**: Por defecto (`false`), los daemons descartan claims `_ilp_taint_claim` no autenticados enviados por clientes. Requiere la bandera explícita `--trust-client-claims` para habilitar el auto-etiquetado voluntario por parte del cliente.
 - **Guardrail de red no-loopback:** El enlace a interfaces de red externas (`0.0.0.0` o IPs públicas) está bloqueado por defecto; requiere la presencia explícita de `--allow-non-loopback` y una clave pre-compartida válida.

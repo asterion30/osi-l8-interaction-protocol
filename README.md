@@ -23,7 +23,7 @@ Para proporcionar total transparencia a auditores de seguridad, ingenieros de si
 | **Monotonic Taint Tracking & Origin Traceability** | ✅ **Implemented** | [`src/governance/taint.rs`](src/governance/taint.rs) (`TaintEvent`, `source_descriptor`, private fields) |
 | **Zero-Deps Policy Engine (`.conf`)** | ✅ **Implemented** | [`src/governance/policy.rs`](src/governance/policy.rs), [`policies/default_msac.conf`](policies/default_msac.conf) |
 | **Stateful TCP Transport & 3-Way Handshake FSM** | ✅ **Implemented** | [`src/transport/`](src/transport/) (`SessionRole::Initiator` vs `Responder`, atomic mutation) |
-| **MCP (JSON-RPC) Shield Adapter & E2E Proxy** | ✅ **Implemented & Verified E2E** | [`src/bridge/`](src/bridge/), [`tests/test_mcp_proxy_e2e.rs`](tests/test_mcp_proxy_e2e.rs) (TCP proxy con prueba de no-ejecución) |
+| **MCP (JSON-RPC) Shield Adapter & E2E Proxy** | ✅ **Implemented (Deployable Sidecar & Gateway Binaries with PSK Auth, Anti-Replay & Auto-Taint)** | [`src/bridge/`](src/bridge/), [`tests/test_mcp_proxy_e2e.rs`](tests/test_mcp_proxy_e2e.rs), [`src/bin/`](src/bin/) (Sidecar & Gateway autónomos con autenticación PSK, fail-closed anti-replay y prueba Zero-Connect) |
 | **Linux Kernel eBPF / LSM Socket Hooks** | 🗺️ **Architectural Specification (Roadmap)** | [`docs/ARCHITECTURE_SPEC.md`](docs/ARCHITECTURE_SPEC.md) (Fase 4 del estándar) |
 
 ---
@@ -78,7 +78,7 @@ El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento
 ## 🚀 Inicio Rápido (Quickstart)
 
 ```bash
-# 1. Ejecutar la suite completa de 54 pruebas de integración y unitarias
+# 1. Ejecutar la suite completa de 65 pruebas de integración y unitarias
 cargo test --all-targets --all-features
 
 # 2. Correr el benchmark formal reproducible y generar docs/BENCHMARK_RESULTS.md
@@ -261,15 +261,15 @@ osi-l8-interaction-protocol/
 │   │   └── ilp_mcp_gateway.rs                            # Daemon autónomo CLI de producción MCP Gateway
 │   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway)
 │   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 62 tests de integración y verificación E2E (100% pasando)
+├── tests/                                                # 65 tests de integración y verificación E2E (100% pasando)
 │   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking y simetría binaria (9 tests)
 │   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint y MSAC (14 tests)
 │   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (7 tests)
 │   ├── test_tcp_transport.rs                             # Sockets TCP reales y contención OOM (4 tests)
 │   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
 │   ├── test_mcp_bridge.rs                                # Mapeo estricto, correlación con TTL, purga e in-flight (11 tests)
-│   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: Zero-Connect, cota 64 KiB, Slowloris, PSK MAC, ReplayGuard (10 tests)
-│   └── test_cli_binaries.rs                              # Subprocess smoke tests CLI Gateway y Sidecar, PSK file/env (5 tests)
+│   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: Zero-Connect, cota 64 KiB, Slowloris, PSK MAC, ReplayGuard fail-closed (11 tests)
+│   └── test_cli_binaries.rs                              # Subprocess smoke tests CLI Gateway y Sidecar, rechazo de symlink, PSK file/env (6 tests)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
     ├── live_agent_proxy.rs                               # Comunicación en vivo entre 2 agentes por TCP

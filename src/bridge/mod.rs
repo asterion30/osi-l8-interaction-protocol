@@ -13,5 +13,6 @@ pub use mcp_adapter::{McpRpcRequest, McpRpcResponse, McpSessionCorrelationTable}
 #[cfg(feature = "mcp")]
 pub use proxy::{
     read_bounded_line_with_deadline, ClientIngressResult, ConnectionPermit, GatewayConfig,
-    IlpMcpGateway, McpGatewayServer, McpProxyRelay, McpSidecarServer, ProxyError, SidecarConfig,
+    IlpMcpGateway, McpGatewayServer, McpProxyRelay, McpSidecarServer, ProxyError, ReplayGuard,
+    SidecarConfig,
 };

@@ -53,6 +53,7 @@ pub enum ProxyError {
     McpBridge(McpBridgeError),
     AuthFailed(String),
     ReplayDetected,
+    ReplayCapacityExhausted,
 }
 
 #[cfg(feature = "mcp")]
@@ -72,6 +73,12 @@ impl std::fmt::Display for ProxyError {
                 write!(
                     f,
                     "Replay attack detected: duplicate negotiation session UUID"
+                )
+            }
+            Self::ReplayCapacityExhausted => {
+                write!(
+                    f,
+                    "Replay protection table saturated: fail-closed under load"
                 )
             }
         }
@@ -176,6 +183,10 @@ impl Drop for ConnectionPermit {
 #[cfg(feature = "mcp")]
 /// Registro de protección anti-replay para tramas I-PDU en espacio de usuario.
 ///
+/// **Alcance de Unicidad**: El `session_uuid` se asume único por dominio de clave PSK y por instancia
+/// del Gateway. Los clientes deben generar UUIDs aleatorios criptográficamente seguros para cada
+/// sesión o transacción de negociación.
+///
 /// Rastrea los `session_uuid` observados dentro de una ventana de tiempo acotada (`window_ttl`)
 /// y una capacidad máxima (`max_entries`). Cualquier retransmisión de un UUID idéntico dentro de
 /// la ventana es rechazada para mitigar ataques de repetición.
@@ -205,12 +216,16 @@ impl ReplayGuard {
             .retain(|_, timestamp| now.duration_since(*timestamp) < ttl);
     }
 
-    /// Verifica si un `session_uuid` ya fue procesado.
+    /// Verifica si un `session_uuid` ya fue procesado o si la tabla está saturada.
     ///
-    /// Si ya existe dentro de la ventana de validez, retorna `Err(ProxyError::ReplayDetected)`.
-    /// En caso contrario, lo registra y retorna `Ok(())`.
+    /// Política Fail-Closed:
+    /// 1. Si `session_uuid` ya existe en la tabla y sigue dentro de la ventana de validez,
+    ///    retorna `Err(ProxyError::ReplayDetected)`.
+    /// 2. Si la tabla está en su capacidad máxima (`>= max_entries`), purga las entradas expiradas.
+    /// 3. Si tras la purga la tabla sigue llena (`>= max_entries`), retorna
+    ///    `Err(ProxyError::ReplayCapacityExhausted)` SIN desalojar ninguna entrada válida vigente.
+    /// 4. Solo si hay capacidad disponible, registra `session_uuid` y retorna `Ok(())`.
     pub fn check_and_record(&mut self, session_uuid: u64) -> Result<(), ProxyError> {
-        self.purge_expired();
         let now = Instant::now();
         if let Some(timestamp) = self.seen.get(&session_uuid) {
             if now.duration_since(*timestamp) < self.window_ttl {
@@ -218,9 +233,10 @@ impl ReplayGuard {
             }
         }
         if self.seen.len() >= self.max_entries {
-            if let Some(&oldest_key) = self.seen.iter().min_by_key(|(_, &ts)| ts).map(|(k, _)| k) {
-                self.seen.remove(&oldest_key);
-            }
+            self.purge_expired();
+        }
+        if self.seen.len() >= self.max_entries {
+            return Err(ProxyError::ReplayCapacityExhausted);
         }
         self.seen.insert(session_uuid, now);
         Ok(())
@@ -844,19 +860,27 @@ impl McpGatewayServer {
                                     }
                                 }
 
-                                // 2. Anti-Replay Guard: Detección y rechazo de tramas con session_uuid duplicado
-                                if let Err(ProxyError::ReplayDetected) = replay_ref
+                                // 2. Anti-Replay Guard: Detección y rechazo de tramas con session_uuid duplicado o saturación
+                                if let Err(e) = replay_ref
                                     .lock()
                                     .unwrap()
                                     .check_and_record(packet.header().session_uuid)
                                 {
+                                    let err_msg = match e {
+                                        ProxyError::ReplayCapacityExhausted => {
+                                            "Gateway replay protection table saturated; try again later"
+                                        }
+                                        _ => {
+                                            "Replay attack detected: duplicate negotiation session UUID"
+                                        }
+                                    };
                                     let err_resp = McpRpcResponse {
                                         jsonrpc: "2.0".to_string(),
                                         id: serde_json::Value::Null,
                                         result: None,
                                         error: Some(serde_json::json!({
                                             "code": -32003,
-                                            "message": "Replay attack detected: duplicate negotiation session UUID"
+                                            "message": err_msg
                                         })),
                                     };
                                     let mut resp_pkt = match McpBridge::encapsulate_response(

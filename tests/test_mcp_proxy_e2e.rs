@@ -1017,3 +1017,48 @@ deny_external_egress_if_tainted = true
         r3_2
     );
 }
+
+#[test]
+fn test_replay_guard_fail_closed_under_load() {
+    use ilp_core::bridge::{ProxyError, ReplayGuard};
+
+    // Capacidad: 5 entradas, TTL: 300ms
+    let mut guard = ReplayGuard::new(Duration::from_millis(300), 5);
+
+    // 1. Insertar 5 UUIDs distintos -> Todos deben tener éxito
+    for i in 1..=5 {
+        assert!(
+            guard.check_and_record(i).is_ok(),
+            "UUID {} debería registrarse exitosamente",
+            i
+        );
+    }
+
+    // 2. Intentar insertar un 6to UUID mientras la tabla está saturada -> Err(ReplayCapacityExhausted)
+    match guard.check_and_record(6) {
+        Err(ProxyError::ReplayCapacityExhausted) => {}
+        other => panic!(
+            "Esperado ReplayCapacityExhausted bajo saturación, se obtuvo: {:?}",
+            other
+        ),
+    }
+
+    // 3. Verificar que el UUID 1 NO fue desalojado por el intento de inserción (Fail-Closed)
+    // Al intentar registrar nuevamente el UUID 1, debe detectarse como ReplayDetected, NO insertarse de nuevo
+    match guard.check_and_record(1) {
+        Err(ProxyError::ReplayDetected) => {}
+        other => panic!(
+            "Esperado ReplayDetected para UUID 1 aún vigente, se obtuvo: {:?}",
+            other
+        ),
+    }
+
+    // 4. Esperar a que expire la ventana TTL (> 300ms)
+    thread::sleep(Duration::from_millis(350));
+
+    // 5. Tras la expiración, la siguiente inserción debe purgar las expiradas y tener éxito
+    assert!(
+        guard.check_and_record(7).is_ok(),
+        "Tras expirar TTL, nueva entrada debe tener éxito"
+    );
+}

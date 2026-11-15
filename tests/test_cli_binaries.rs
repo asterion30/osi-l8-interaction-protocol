@@ -277,3 +277,57 @@ fn test_cli_binaries_psk_file_and_env_loading() {
 
     let _ = std::fs::remove_file(&psk_path);
 }
+
+#[test]
+fn test_cli_binaries_symlink_psk_rejected() {
+    let sidecar_bin = env!("CARGO_BIN_EXE_ilp_mcp_sidecar");
+    let gateway_bin = env!("CARGO_BIN_EXE_ilp_mcp_gateway");
+
+    let tmp_dir = std::env::temp_dir();
+    let target_path = tmp_dir.join(format!("test_ilp_real_psk_{}.key", std::process::id()));
+    let symlink_path = tmp_dir.join(format!("test_ilp_symlink_psk_{}.key", std::process::id()));
+
+    std::fs::write(&target_path, "00112233445566778899aabbccddeeff\n")
+        .expect("Write real PSK file");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o600))
+            .expect("Set 0600 permissions");
+        let _ = std::fs::remove_file(&symlink_path);
+        std::os::unix::fs::symlink(&target_path, &symlink_path).expect("Create PSK symlink");
+
+        // 1. Sidecar con symlink debe fallar con código no-cero
+        let sc_status = Command::new(sidecar_bin)
+            .args([
+                "--check-config",
+                "--psk-file",
+                symlink_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("Execute sidecar with symlink PSK");
+        assert!(
+            !sc_status.success(),
+            "Sidecar DEBE rechazar --psk-file cuando es un enlace simbólico"
+        );
+
+        // 2. Gateway con symlink debe fallar con código no-cero
+        let gw_status = Command::new(gateway_bin)
+            .args([
+                "--check-config",
+                "--psk-file",
+                symlink_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("Execute gateway with symlink PSK");
+        assert!(
+            !gw_status.success(),
+            "Gateway DEBE rechazar --psk-file cuando es un enlace simbólico"
+        );
+
+        let _ = std::fs::remove_file(&symlink_path);
+    }
+
+    let _ = std::fs::remove_file(&target_path);
+}

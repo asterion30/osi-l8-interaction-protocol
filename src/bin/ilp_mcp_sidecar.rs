@@ -42,45 +42,12 @@ fn main() {
 }
 
 #[cfg(feature = "mcp")]
-fn parse_hex_psk(hex_str: &str) -> Result<[u8; 16], String> {
-    let trimmed = hex_str
-        .trim()
-        .trim_start_matches("0x")
-        .trim_start_matches("0X");
-    if trimmed.len() != 32 {
-        return Err(format!(
-            "La clave PSK debe contener exactamente 32 dígitos hexadecimales (128 bits), se recibieron {}",
-            trimmed.len()
-        ));
-    }
-    let mut key = [0u8; 16];
-    for (i, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
-        let pair = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
-        key[i] = u8::from_str_radix(pair, 16)
-            .map_err(|e| format!("Valor hexadecimal inválido '{}': {}", pair, e))?;
-    }
-    Ok(key)
-}
+use ilp_core::ipdu::{load_psk_from_file_secure, parse_hex_psk};
 
 #[cfg(feature = "mcp")]
 fn load_psk(psk_file: Option<&str>, psk_hex: Option<&str>) -> Result<Option<[u8; 16]>, String> {
     if let Some(path) = psk_file {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::metadata(path)
-                .map_err(|e| format!("No se pudo acceder al archivo PSK '{}': {}", path, e))?;
-            let mode = meta.permissions().mode();
-            if mode & 0o077 != 0 {
-                return Err(format!(
-                    "Permisos inseguros en archivo PSK '{}' (modo {:o}): debe ser accesible solo por el propietario (chmod 600 o 400)",
-                    path, mode
-                ));
-            }
-        }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Error al leer archivo PSK '{}': {}", path, e))?;
-        let key = parse_hex_psk(&content)?;
+        let key = load_psk_from_file_secure(path)?;
         return Ok(Some(key));
     }
 

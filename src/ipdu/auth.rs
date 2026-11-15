@@ -5,7 +5,9 @@
 
 use super::header::IpduHeader;
 
-/// Implementación canónica determinista de SipHash-2-4 de 64 bits (RFC 7693) en Rust estándar.
+/// Implementación canónica determinista de SipHash-2-4 de 64 bits
+/// ("SipHash: a fast short-input PRF", Jean-Philippe Aumasson & Daniel J. Bernstein, INDOCRYPT 2012)
+/// en Rust estándar.
 pub struct SipHash24 {
     v0: u64,
     v1: u64,
@@ -137,18 +139,106 @@ pub fn compute_frame_mac(header: &IpduHeader, payload: &[u8], secret_key: &[u8; 
     hasher.finish()
 }
 
-/// Verifica el MAC de integridad de una trama I-PDU en tiempo constante mitigado con barrera de compilador `black_box`.
+/// Parsea una cadena hexadecimal de 32 caracteres (128 bits) a `[u8; 16]`.
+pub fn parse_hex_psk(hex_str: &str) -> Result<[u8; 16], String> {
+    let trimmed = hex_str
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    if trimmed.len() != 32 {
+        return Err(format!(
+            "La clave PSK debe contener exactamente 32 dígitos hexadecimales (128 bits), se recibieron {}",
+            trimmed.len()
+        ));
+    }
+    let mut key = [0u8; 16];
+    for (i, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
+        let pair = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        key[i] = u8::from_str_radix(pair, 16)
+            .map_err(|e| format!("Valor hexadecimal inválido '{}': {}", pair, e))?;
+    }
+    Ok(key)
+}
+
+/// Carga una clave pre-compartida (PSK) de 128 bits desde un archivo de forma segura y libre de TOCTOU.
+///
+/// Garantías de seguridad:
+/// 1. Rechaza enlaces simbólicos (symlinks) usando `symlink_metadata` antes de abrir.
+/// 2. Abre el descriptor de archivo una sola vez (`File::open`).
+/// 3. Valida en el descriptor abierto (`fstat` vía `file.metadata()?`) que sea un archivo regular
+///    y que en plataformas Unix no tenga permisos para grupo ni otros (`mode & 0o077 == 0`).
+/// 4. Acota la lectura a un máximo de 256 bytes (`file.take(256).read_to_string`) para mitigar DoS.
+pub fn load_psk_from_file_secure(path: &str) -> Result<[u8; 16], String> {
+    use std::io::Read;
+
+    // 1. Detección explícita de symlink
+    let sym_meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("No se pudo inspeccionar el archivo PSK '{}': {}", path, e))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err("Security error: --psk-file must not be a symbolic link".to_string());
+    }
+
+    // 2. Apertura única del descriptor
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("No se pudo abrir el archivo PSK '{}': {}", path, e))?;
+
+    // 3. Inspección sobre el descriptor abierto (fstat) libre de TOCTOU
+    let meta = file.metadata().map_err(|e| {
+        format!(
+            "No se pudo obtener metadata del archivo PSK abierto '{}': {}",
+            path, e
+        )
+    })?;
+
+    if !meta.is_file() {
+        return Err(format!("'{}' no es un archivo regular", path));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "Permisos inseguros en archivo PSK '{}' (modo {:o}): debe ser accesible solo por el propietario (chmod 600 o 400)",
+                path, mode
+            ));
+        }
+    }
+
+    // 4. Lectura acotada a 256 bytes
+    let mut content = String::new();
+    (&mut file)
+        .take(256)
+        .read_to_string(&mut content)
+        .map_err(|e| format!("Error al leer archivo PSK '{}': {}", path, e))?;
+
+    parse_hex_psk(&content)
+}
+
+/// Verifica el MAC de integridad de una trama I-PDU comparando byte a byte en tiempo constante
+/// mitigado con barrera de optimización del compilador (`black_box`).
+///
+/// **Alcance Criptográfico del Tag de 64 bits**:
+/// SipHash-2-4 produce un tag de autenticación de 64 bits. Para tráfico de red a alta velocidad,
+/// una colisión accidental o de falsificación ciega tiene una probabilidad de 2^-64 por intento,
+/// lo cual es suficiente para integridad de trama punto a punto. La comparación se realiza sobre
+/// los 8 bytes independientes acumulando un XOR en tiempo constante para mitigar ataques de canal
+/// lateral (timing side-channels).
 pub fn verify_frame_mac(
     header: &IpduHeader,
     payload: &[u8],
     secret_key: &[u8; 16],
     expected_mac: u64,
 ) -> bool {
-    let computed = compute_frame_mac(header, payload, secret_key);
-    // Comparación XOR mitigada con barrera de compilador black_box para prevenir optimizaciones de ramificación
-    let a = std::hint::black_box(computed);
-    let b = std::hint::black_box(expected_mac);
-    std::hint::black_box(a ^ b) == 0
+    let computed_mac = compute_frame_mac(header, payload, secret_key);
+    let a = computed_mac.to_le_bytes();
+    let b = expected_mac.to_le_bytes();
+    let mut diff: u8 = 0;
+    for i in 0..8 {
+        diff |= std::hint::black_box(a[i] ^ b[i]);
+    }
+    std::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]
@@ -187,5 +277,29 @@ mod tests {
         // Payload alterado debe fallar
         let tampered_payload = b"{\"intent\":\"hijacked_financial_transfer\"}";
         assert!(!verify_frame_mac(&header, tampered_payload, &key, mac1));
+    }
+
+    #[test]
+    fn test_siphash24_official_paper_vectors() {
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+
+        // 1. Vector oficial para input vacío (0 bytes) -> 0x726fdb47dd0e0e31
+        let mut hasher0 = SipHash24::new_with_key(&key);
+        hasher0.update(&[]);
+        assert_eq!(hasher0.finish(), 0x726fdb47dd0e0e31);
+
+        // 2. Vector oficial para 1 byte [0x00] -> 0x74f839c593dc67fd
+        let mut hasher1 = SipHash24::new_with_key(&key);
+        hasher1.update(&[0x00]);
+        assert_eq!(hasher1.finish(), 0x74f839c593dc67fd);
+
+        // 3. Vector oficial para bytes 0..14 [0x00..=0x0e] (15 bytes) -> 0xa129ca6149be45e5
+        let in15: Vec<u8> = (0..=14).collect();
+        let mut hasher15 = SipHash24::new_with_key(&key);
+        hasher15.update(&in15);
+        assert_eq!(hasher15.finish(), 0xa129ca6149be45e5);
     }
 }
