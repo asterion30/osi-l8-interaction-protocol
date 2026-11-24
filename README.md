@@ -24,8 +24,8 @@ Para proporcionar total transparencia a auditores de seguridad, ingenieros de si
 | **Monotonic Taint Tracking & Origin Traceability** | ✅ **Implemented** | [`src/governance/taint.rs`](src/governance/taint.rs) (`TaintEvent`, `source_descriptor`, private fields) |
 | **Zero-Deps Policy Engine (`.conf`)** | ✅ **Implemented** | [`src/governance/policy.rs`](src/governance/policy.rs), [`policies/default_msac.conf`](policies/default_msac.conf) (con `custom_dlp_deny_pattern`) |
 | **Stateful TCP Transport & 3-Way Handshake FSM** | ✅ **Implemented** | [`src/transport/`](src/transport/) (`SessionRole::Initiator` vs `Responder`, atomic mutation) |
-| **MCP (JSON-RPC) Shield Adapter & E2E Proxy** | ✅ **Implemented (Deployable Sidecar & Gateway Binaries)** | [`src/bridge/`](src/bridge/), [`tests/test_mcp_proxy_e2e.rs`](tests/test_mcp_proxy_e2e.rs), [`src/bin/`](src/bin/) (Dual-PSK zero-downtime, CSPRNG, Anti-Replay fail-closed, SIEM JSONL) |
-| **Production Deployment Assets (Docker & Systemd)** | ✅ **Implemented & Hardened** | [`deploy/`](deploy/) (Multi-stage unprivileged Dockerfile UID 10001, isolated Compose, systemd units) |
+| **MCP (JSON-RPC) Shield Adapter & E2E Proxy** | ✅ **Implemented (Deployable Sidecar & Gateway Binaries)** | [`src/bridge/`](src/bridge/), [`tests/test_mcp_proxy_e2e.rs`](tests/test_mcp_proxy_e2e.rs), [`src/bin/`](src/bin/) (Transporte `--stdio` para Claude/Cursor, puente `--backend-cmd` de procesos hijo, Dual-PSK zero-downtime, CSPRNG, Anti-Replay fail-closed, SIEM JSONL) |
+| **Production Deployment & SIEM Assets** | ✅ **Implemented & Hardened** | [`deploy/`](deploy/) (Reglas SIEM Wazuh nativas en `deploy/siem/wazuh/`, Dockerfile no-root UID 10001, docker-compose aislado, unidades systemd) |
 | **Linux Kernel eBPF / LSM Socket Hooks** | 🗺️ **Architectural Specification (Roadmap)** | [`docs/ARCHITECTURE_SPEC.md`](docs/ARCHITECTURE_SPEC.md) (Fase 4 del estándar) |
 
 ---
