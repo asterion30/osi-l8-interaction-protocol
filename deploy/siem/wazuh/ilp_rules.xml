@@ -1,0 +1,89 @@
+<!--
+  RFC-ILP-2026: Capa 8 Interaction Layer Protocol (ILP) - Wazuh SIEM Detection Rules
+  Mapea eventos de auditoría forense JSONL generados por ilp_mcp_sidecar e ilp_mcp_gateway.
+-->
+<group name="ilp,capa8,msac,">
+
+  <!-- Regla Base: Cualquier evento de auditoría estructurada de Capa 8 -->
+  <rule id="100300" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="component">^mcp_sidecar$|^mcp_gateway$</field>
+    <description>Capa 8 ILP: Evento de auditoría de seguridad registrado por $(component)</description>
+    <group>ilp,audit,</group>
+  </rule>
+
+  <!-- Regla Informativa: Solicitud autorizada (ALLOW) -->
+  <rule id="100301" level="3">
+    <if_sid>100300</if_sid>
+    <field name="verdict">^ALLOW$</field>
+    <description>Capa 8 ILP: Solicitud MCP evaluada y permitida hacia el backend (Session UUID: $(session_uuid))</description>
+    <group>ilp,allow,</group>
+  </rule>
+
+  <!-- Regla de Alerta: Solicitud bloqueada por CRM / MSAC (DROP) -->
+  <rule id="100310" level="10">
+    <if_sid>100300</if_sid>
+    <field name="verdict">^DROP$</field>
+    <description>Capa 8 MSAC: Petición MCP bloqueada por política de gobernanza (Razón: $(reason))</description>
+    <mitre>
+      <id>T1059</id>
+      <id>T1562</id>
+    </mitre>
+    <group>ilp,drop,msac,</group>
+  </rule>
+
+  <!-- Regla de Alta Severidad: Fallo de autenticación MAC de trama I-PDU -->
+  <rule id="100320" level="12">
+    <if_sid>100300</if_sid>
+    <field name="error_code">^-32001$</field>
+    <description>Capa 8 ALERTA: Fallo de autenticación criptográfica MAC (SipHash-2-4) o manipulación de trama I-PDU</description>
+    <mitre>
+      <id>T1557</id>
+      <id>T1565</id>
+    </mitre>
+    <group>ilp,authentication_failure,crypto,</group>
+  </rule>
+
+  <!-- Regla de Alta Severidad: Ataque de repetición detectado (Replay Attack) -->
+  <rule id="100321" level="12">
+    <if_sid>100300</if_sid>
+    <field name="error_code">^-32003$</field>
+    <description>Capa 8 ALERTA: Ataque de repetición detectado por ReplayGuard (Session UUID duplicado: $(session_uuid))</description>
+    <mitre>
+      <id>T1565.001</id>
+    </mitre>
+    <group>ilp,replay_attack,</group>
+  </rule>
+
+  <!-- Regla Crítica: Intento de Inyección de Prompt Detectado por Heuristic Gatekeeper -->
+  <rule id="100330" level="12">
+    <if_sid>100310</if_sid>
+    <field name="error_code">^-32007$</field>
+    <description>Capa 8 CRÍTICO: Intento de Prompt Injection / Jailbreak interceptado en memoria (Zero-Connect)</description>
+    <mitre>
+      <id>T1059</id>
+    </mitre>
+    <group>ilp,prompt_injection,gatekeeper,</group>
+  </rule>
+
+  <!-- Regla Crítica: Violación de DLP / Fuga de Datos Clasificados (Taint Ingress/Egress) -->
+  <rule id="100331" level="12">
+    <if_sid>100310</if_sid>
+    <field name="error_code">^-32008$</field>
+    <description>Capa 8 CRÍTICO: Violación de DLP o egreso de datos clasificados bloqueado por flujo de información contaminada (Taint)</description>
+    <mitre>
+      <id>T1048</id>
+      <id>T1567</id>
+    </mitre>
+    <group>ilp,data_leak,dlp,taint,</group>
+  </rule>
+
+  <!-- Regla de Advertencia: Exceso de Presupuesto Computable (Budget Cap Exceeded) -->
+  <rule id="100340" level="8">
+    <if_sid>100310</if_sid>
+    <field name="error_code">^-32002$|^-32004$</field>
+    <description>Capa 8 ADVERTENCIA: Techo de presupuesto computable o tiempo de vida (TTL) excedido</description>
+    <group>ilp,budget_exceeded,</group>
+  </rule>
+
+</group>

@@ -38,6 +38,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(feature = "mcp")]
 use std::net::{TcpListener, TcpStream};
 #[cfg(feature = "mcp")]
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(feature = "mcp")]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "mcp")]
 use std::sync::{Arc, Mutex};
@@ -189,6 +191,10 @@ pub struct SidecarConfig {
     pub trust_client_taint_claims: bool,
     /// Tiempo máximo de espera para drenar conexiones activas durante un apagado graceful. Default: 2.000 ms.
     pub drain_timeout: Duration,
+    /// Comando opcional para ejecutar un backend MCP por stdio (stdin/stdout) en modo Gateway.
+    pub backend_cmd: Option<String>,
+    /// Argumentos para el comando de backend stdio.
+    pub backend_args: Vec<String>,
 }
 
 #[cfg(feature = "mcp")]
@@ -207,6 +213,8 @@ impl Default for SidecarConfig {
             audit_log_path: None,
             trust_client_taint_claims: false,
             drain_timeout: Duration::from_millis(2_000),
+            backend_cmd: None,
+            backend_args: Vec::new(),
         }
     }
 }
@@ -318,6 +326,87 @@ impl ReplayGuard {
 impl Default for ReplayGuard {
     fn default() -> Self {
         Self::new(Duration::from_secs(60), 4096)
+    }
+}
+
+#[cfg(feature = "mcp")]
+/// Envoltorio RAII de proceso hijo backend para servidores MCP locales sobre stdio.
+#[derive(Debug)]
+pub struct ChildBackendProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_reader: BufReader<ChildStdout>,
+}
+
+#[cfg(feature = "mcp")]
+impl ChildBackendProcess {
+    /// Inicia el proceso hijo con stdin/stdout redireccionados por pipes.
+    pub fn spawn(cmd: &str, args: &[String]) -> std::io::Result<Self> {
+        let mut child = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture child stdin")
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture child stdout")
+        })?;
+        let stdout_reader = BufReader::new(stdout);
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout_reader,
+        })
+    }
+
+    /// Envía una solicitud delimitada por línea al hijo y lee la respuesta acotada a `max_bytes`.
+    pub fn send_and_receive(&mut self, req_line: &str, max_bytes: usize) -> Result<String, String> {
+        self.stdin
+            .write_all(req_line.as_bytes())
+            .map_err(|e| format!("Child stdin write error: {}", e))?;
+        self.stdin
+            .flush()
+            .map_err(|e| format!("Child stdin flush error: {}", e))?;
+
+        let mut resp_line = String::new();
+        let mut take_reader = (&mut self.stdout_reader).take(max_bytes as u64 + 1);
+        take_reader
+            .read_line(&mut resp_line)
+            .map_err(|e| format!("Child stdout read error: {}", e))?;
+
+        if resp_line.is_empty() {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(format!(
+                    "Child backend process exited with status: {}",
+                    status
+                ));
+            }
+            return Err("Empty response or closed stdout from backend process".to_string());
+        }
+
+        if resp_line.len() > max_bytes {
+            return Err("Backend response exceeded max line bytes".to_string());
+        }
+
+        Ok(resp_line)
+    }
+
+    /// Termina el proceso hijo limpiamente y recolecta el estado para evitar procesos zombis.
+    pub fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(feature = "mcp")]
+impl Drop for ChildBackendProcess {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -489,6 +578,283 @@ impl IlpMcpGateway {
 }
 
 #[cfg(feature = "mcp")]
+/// Despacha una línea JSON-RPC de cliente evaluándola contra el firewall cognitivo (Zero-Connect)
+/// y reenviándola al Gateway si es aprobada. Escribe la respuesta JSON-RPC en el `client_writer`.
+/// Retorna `true` si la conexión sigue viva, `false` si el cliente cerró o falló la escritura.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_client_jsonrpc_request<W: Write>(
+    line: &str,
+    client_writer: &mut W,
+    firewall: &mut CognitiveFirewall,
+    client_taint: &mut ProcessTaintContext,
+    corr_ref: &McpSessionCorrelationTable,
+    client_conn_id: u64,
+    gateway_target: &str,
+    cfg: &SidecarConfig,
+    metrics_worker: &ServerMetrics,
+) -> bool {
+    metrics_worker
+        .total_requests
+        .fetch_add(1, Ordering::Relaxed);
+
+    // Inspección de claims de tinte explícitos en los parámetros de la solicitud
+    if cfg.trust_client_taint_claims {
+        if let Ok(req_val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(claim) = req_val
+                .get("params")
+                .and_then(|p| p.get("_ilp_taint_claim"))
+                .and_then(|c| c.as_str())
+            {
+                if let Some(tag) = TaintTag::from_name(claim) {
+                    client_taint.apply_taint(tag, "mcp:client:taint_claim");
+                }
+            }
+        }
+    }
+
+    match McpProxyRelay::evaluate_client_request(
+        line,
+        firewall,
+        client_taint,
+        corr_ref,
+        client_conn_id,
+        cfg.budget_cap,
+        cfg.deadline_ttl_ms,
+        cfg.session_ttl,
+    ) {
+        Ok(ClientIngressResult::Forwarded {
+            mut packet,
+            decision,
+        }) => {
+            write_audit_log_line(
+                cfg.audit_log_path.as_deref(),
+                &decision.audit_record.to_jsonl_line("mcp_sidecar"),
+            );
+
+            // Cifrado simétrico de payload ChaCha20 (RFC 8439) si está configurado
+            if cfg.encrypt_payload {
+                let key_bytes = cfg.psk.unwrap_or([0u8; 16]);
+                chacha20_crypt_payload(
+                    &key_bytes,
+                    packet.header().session_uuid,
+                    packet.header().deadline_ttl_ms,
+                    packet.header().max_budget_cap,
+                    false,
+                    packet.payload_bytes_mut(),
+                );
+                packet.set_policy_flags(
+                    packet.header().policy_flags | CognitivePolicyFlags::ENCRYPTED_PAYLOAD,
+                );
+            }
+
+            // Encrypt-then-MAC: Firma criptográfica sobre el ciphertext de la trama
+            if let Some(ref key) = cfg.psk {
+                let mac = compute_frame_mac(packet.header(), packet.payload(), key);
+                packet.set_user_rule_sig_hash(mac);
+            }
+
+            // Zero-Connect: Conexión abierta ÚNICAMENTE tras aprobación formal
+            match TcpStream::connect(gateway_target) {
+                Ok(gateway_tcp) => {
+                    let _ = gateway_tcp.set_read_timeout(Some(cfg.io_timeout));
+                    let _ = gateway_tcp.set_write_timeout(Some(cfg.io_timeout));
+
+                    let mut ilp_stream = IlpStream::new(gateway_tcp);
+                    if ilp_stream.send_packet(&packet).is_ok() {
+                        if let Ok(mut resp_packet) = ilp_stream.recv_packet() {
+                            // Verificación de MAC en la respuesta si PSK está activa
+                            if let Some(ref key) = cfg.psk {
+                                if !verify_frame_mac(
+                                    resp_packet.header(),
+                                    resp_packet.payload(),
+                                    key,
+                                    resp_packet.header().user_rule_sig_hash,
+                                ) {
+                                    metrics_worker.auth_failures.fetch_add(1, Ordering::Relaxed);
+                                    let err_resp = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": null,
+                                        "error": {
+                                            "code": -32001,
+                                            "message": "ILP Sidecar: Gateway response frame MAC verification failed"
+                                        }
+                                    });
+                                    let mut err_str = err_resp.to_string();
+                                    err_str.push('\n');
+                                    let _ = client_writer.write_all(err_str.as_bytes());
+                                    let _ = client_writer.flush();
+                                    return false;
+                                }
+                            }
+
+                            // Descifrado de la respuesta si viene cifrada con ChaCha20
+                            if resp_packet
+                                .header()
+                                .policy_flags
+                                .contains(CognitivePolicyFlags::ENCRYPTED_PAYLOAD)
+                            {
+                                let key_bytes = cfg.psk.unwrap_or([0u8; 16]);
+                                chacha20_crypt_payload(
+                                    &key_bytes,
+                                    resp_packet.header().session_uuid,
+                                    resp_packet.header().deadline_ttl_ms,
+                                    resp_packet.header().max_budget_cap,
+                                    true,
+                                    resp_packet.payload_bytes_mut(),
+                                );
+                            }
+
+                            // Taint Ingress Tracking: Detección dinámica de datos sensibles en la respuesta
+                            let detected_tags = HeuristicGatekeeper::detect_sensitive_classes(
+                                resp_packet.payload(),
+                            );
+                            for tag in detected_tags {
+                                client_taint.apply_taint(tag, "mcp:ingress:tool_response");
+                            }
+
+                            if let Ok(resp) = McpBridge::decapsulate_response(&resp_packet) {
+                                match corr_ref.resolve_session(
+                                    client_conn_id,
+                                    &resp.id,
+                                    resp_packet.header().session_uuid,
+                                ) {
+                                    Ok(_) => {
+                                        if let Ok(mut resp_str) = serde_json::to_string(&resp) {
+                                            resp_str.push('\n');
+                                            if client_writer.write_all(resp_str.as_bytes()).is_err()
+                                                || client_writer.flush().is_err()
+                                            {
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                    Err(McpBridgeError::SessionExpired) => {
+                                        let err_resp = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": resp.id,
+                                            "error": {
+                                                "code": -32000,
+                                                "message": "ILP Session expired (TTL exceeded)"
+                                            }
+                                        });
+                                        let mut err_str = err_resp.to_string();
+                                        err_str.push('\n');
+                                        if client_writer.write_all(err_str.as_bytes()).is_err()
+                                            || client_writer.flush().is_err()
+                                        {
+                                            return false;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let err_resp = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": resp.id,
+                                            "error": {
+                                                "code": -32000,
+                                                "message": format!("ILP Session resolution error: {}", e)
+                                            }
+                                        });
+                                        let mut err_str = err_resp.to_string();
+                                        err_str.push('\n');
+                                        if client_writer.write_all(err_str.as_bytes()).is_err()
+                                            || client_writer.flush().is_err()
+                                        {
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            let err_resp = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": null,
+                                "error": {
+                                    "code": -32002,
+                                    "message": "ILP Sidecar: Failed to receive packet from Gateway"
+                                }
+                            });
+                            let mut err_str = err_resp.to_string();
+                            err_str.push('\n');
+                            let _ = client_writer.write_all(err_str.as_bytes());
+                            let _ = client_writer.flush();
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err_resp = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": {
+                            "code": -32603,
+                            "message": format!("Gateway connection failed: {}", e)
+                        }
+                    });
+                    let mut err_str = err_resp.to_string();
+                    err_str.push('\n');
+                    let _ = client_writer.write_all(err_str.as_bytes());
+                    let _ = client_writer.flush();
+                }
+            }
+        }
+        Ok(ClientIngressResult::Blocked {
+            error_response,
+            decision,
+        }) => {
+            metrics_worker
+                .dropped_evaluations
+                .fetch_add(1, Ordering::Relaxed);
+            write_audit_log_line(
+                cfg.audit_log_path.as_deref(),
+                &decision.audit_record.to_jsonl_line("mcp_sidecar"),
+            );
+            let mut err_str = error_response.to_string();
+            err_str.push('\n');
+            if client_writer.write_all(err_str.as_bytes()).is_err()
+                || client_writer.flush().is_err()
+            {
+                return false;
+            }
+        }
+        Err(McpBridgeError::DuplicateInFlightRequestId) => {
+            let err_resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32600,
+                    "message": "Duplicate in-flight request ID on connection"
+                }
+            });
+            let mut err_str = err_resp.to_string();
+            err_str.push('\n');
+            if client_writer.write_all(err_str.as_bytes()).is_err()
+                || client_writer.flush().is_err()
+            {
+                return false;
+            }
+        }
+        Err(e) => {
+            let err_resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32600,
+                    "message": format!("ILP Protocol error: {}", e)
+                }
+            });
+            let mut err_str = err_resp.to_string();
+            err_str.push('\n');
+            if client_writer.write_all(err_str.as_bytes()).is_err()
+                || client_writer.flush().is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+#[cfg(feature = "mcp")]
 /// Servidor Sidecar MCP de producción en espacio de usuario.
 ///
 /// Expone un listener TCP para clientes MCP, evalúa la política MSAC en memoria (Zero-Connect)
@@ -611,283 +977,18 @@ impl McpSidecarServer {
                                     Err(_) => break,
                                 };
 
-                                metrics_worker
-                                    .total_requests
-                                    .fetch_add(1, Ordering::Relaxed);
-
-                                // Inspección de claims de tinte explícitos en los parámetros de la solicitud
-                                if cfg.trust_client_taint_claims {
-                                    if let Ok(req_val) =
-                                        serde_json::from_str::<serde_json::Value>(&line)
-                                    {
-                                        if let Some(claim) = req_val
-                                            .get("params")
-                                            .and_then(|p| p.get("_ilp_taint_claim"))
-                                            .and_then(|c| c.as_str())
-                                        {
-                                            if let Some(tag) = TaintTag::from_name(claim) {
-                                                client_taint
-                                                    .apply_taint(tag, "mcp:client:taint_claim");
-                                            }
-                                        }
-                                    }
-                                }
-
-                                match McpProxyRelay::evaluate_client_request(
+                                if !dispatch_client_jsonrpc_request(
                                     &line,
+                                    &mut client_writer,
                                     &mut firewall_clone,
-                                    &client_taint,
+                                    &mut client_taint,
                                     &corr_ref,
                                     client_conn_id,
-                                    cfg.budget_cap,
-                                    cfg.deadline_ttl_ms,
-                                    cfg.session_ttl,
+                                    &gateway_target,
+                                    &cfg,
+                                    &metrics_worker,
                                 ) {
-                                    Ok(ClientIngressResult::Forwarded {
-                                        mut packet,
-                                        decision,
-                                    }) => {
-                                        write_audit_log_line(
-                                            cfg.audit_log_path.as_deref(),
-                                            &decision.audit_record.to_jsonl_line("mcp_sidecar"),
-                                        );
-
-                                        // Cifrado simétrico de payload ChaCha20 (RFC 8439) si está configurado
-                                        if cfg.encrypt_payload {
-                                            let key_bytes = cfg.psk.unwrap_or([0u8; 16]);
-                                            chacha20_crypt_payload(
-                                                &key_bytes,
-                                                packet.header().session_uuid,
-                                                packet.header().deadline_ttl_ms,
-                                                packet.header().max_budget_cap,
-                                                false,
-                                                packet.payload_bytes_mut(),
-                                            );
-                                            packet.set_policy_flags(
-                                                packet.header().policy_flags
-                                                    | CognitivePolicyFlags::ENCRYPTED_PAYLOAD,
-                                            );
-                                        }
-
-                                        // Encrypt-then-MAC: Firma criptográfica sobre el ciphertext de la trama
-                                        if let Some(ref key) = cfg.psk {
-                                            let mac = compute_frame_mac(
-                                                packet.header(),
-                                                packet.payload(),
-                                                key,
-                                            );
-                                            packet.set_user_rule_sig_hash(mac);
-                                        }
-
-                                        // Zero-Connect: Conexión abierta ÚNICAMENTE tras aprobación formal
-                                        match TcpStream::connect(&gateway_target) {
-                                            Ok(gateway_tcp) => {
-                                                let _ = gateway_tcp
-                                                    .set_read_timeout(Some(cfg.io_timeout));
-                                                let _ = gateway_tcp
-                                                    .set_write_timeout(Some(cfg.io_timeout));
-
-                                                let mut ilp_stream = IlpStream::new(gateway_tcp);
-                                                if ilp_stream.send_packet(&packet).is_ok() {
-                                                    if let Ok(mut resp_packet) =
-                                                        ilp_stream.recv_packet()
-                                                    {
-                                                        // Verificación de MAC en la respuesta si PSK está activa
-                                                        if let Some(ref key) = cfg.psk {
-                                                            if !verify_frame_mac(
-                                                                resp_packet.header(),
-                                                                resp_packet.payload(),
-                                                                key,
-                                                                resp_packet
-                                                                    .header()
-                                                                    .user_rule_sig_hash,
-                                                            ) {
-                                                                metrics_worker
-                                                                    .auth_failures
-                                                                    .fetch_add(
-                                                                        1,
-                                                                        Ordering::Relaxed,
-                                                                    );
-                                                                let err_resp = serde_json::json!({
-                                                                    "jsonrpc": "2.0",
-                                                                    "id": null,
-                                                                    "error": {
-                                                                        "code": -32001,
-                                                                        "message": "ILP Sidecar: Gateway response frame MAC verification failed"
-                                                                    }
-                                                                });
-                                                                let mut err_str =
-                                                                    err_resp.to_string();
-                                                                err_str.push('\n');
-                                                                let _ = client_writer
-                                                                    .write_all(err_str.as_bytes());
-                                                                let _ = client_writer.flush();
-                                                                break;
-                                                            }
-                                                        }
-
-                                                        // Descifrado de la respuesta si viene cifrada con ChaCha20
-                                                        if resp_packet
-                                                            .header()
-                                                            .policy_flags
-                                                            .contains(
-                                                            CognitivePolicyFlags::ENCRYPTED_PAYLOAD,
-                                                        ) {
-                                                            let key_bytes =
-                                                                cfg.psk.unwrap_or([0u8; 16]);
-                                                            chacha20_crypt_payload(
-                                                                &key_bytes,
-                                                                resp_packet.header().session_uuid,
-                                                                resp_packet
-                                                                    .header()
-                                                                    .deadline_ttl_ms,
-                                                                resp_packet.header().max_budget_cap,
-                                                                true,
-                                                                resp_packet.payload_bytes_mut(),
-                                                            );
-                                                        }
-
-                                                        // Taint Ingress Tracking: Detección dinámica de datos sensibles en la respuesta
-                                                        // Afecta exclusivamente al contexto de tinte aislado de este cliente
-                                                        let detected_tags =
-                                                            HeuristicGatekeeper::detect_sensitive_classes(
-                                                                resp_packet.payload(),
-                                                            );
-                                                        for tag in detected_tags {
-                                                            client_taint.apply_taint(
-                                                                tag,
-                                                                "mcp:ingress:tool_response",
-                                                            );
-                                                        }
-
-                                                        if let Ok(resp) =
-                                                            McpBridge::decapsulate_response(
-                                                                &resp_packet,
-                                                            )
-                                                        {
-                                                            // Consumo y verificación estricta de session_uuid y expiración
-                                                            match corr_ref.resolve_session(
-                                                                client_conn_id,
-                                                                &resp.id,
-                                                                resp_packet.header().session_uuid,
-                                                            ) {
-                                                                Ok(_) => {
-                                                                    if let Ok(mut resp_str) =
-                                                                        serde_json::to_string(&resp)
-                                                                    {
-                                                                        resp_str.push('\n');
-                                                                        let _ = client_writer
-                                                                            .write_all(
-                                                                                resp_str.as_bytes(),
-                                                                            );
-                                                                        let _ =
-                                                                            client_writer.flush();
-                                                                    }
-                                                                }
-                                                                Err(
-                                                                    McpBridgeError::SessionExpired,
-                                                                ) => {
-                                                                    let err_resp = serde_json::json!({
-                                                                        "jsonrpc": "2.0",
-                                                                        "id": resp.id,
-                                                                        "error": {
-                                                                            "code": -32000,
-                                                                            "message": "ILP Session expired (TTL exceeded)"
-                                                                        }
-                                                                    });
-                                                                    let mut err_str =
-                                                                        err_resp.to_string();
-                                                                    err_str.push('\n');
-                                                                    let _ = client_writer
-                                                                        .write_all(
-                                                                            err_str.as_bytes(),
-                                                                        );
-                                                                    let _ = client_writer.flush();
-                                                                }
-                                                                Err(e) => {
-                                                                    let err_resp = serde_json::json!({
-                                                                        "jsonrpc": "2.0",
-                                                                        "id": resp.id,
-                                                                        "error": {
-                                                                            "code": -32000,
-                                                                            "message": format!("ILP Session resolution error: {}", e)
-                                                                        }
-                                                                    });
-                                                                    let mut err_str =
-                                                                        err_resp.to_string();
-                                                                    err_str.push('\n');
-                                                                    let _ = client_writer
-                                                                        .write_all(
-                                                                            err_str.as_bytes(),
-                                                                        );
-                                                                    let _ = client_writer.flush();
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                let err_resp = serde_json::json!({
-                                                    "jsonrpc": "2.0",
-                                                    "id": null,
-                                                    "error": {
-                                                        "code": -32603,
-                                                        "message": format!("Gateway connection failed: {}", e)
-                                                    }
-                                                });
-                                                let mut err_str = err_resp.to_string();
-                                                err_str.push('\n');
-                                                let _ = client_writer.write_all(err_str.as_bytes());
-                                                let _ = client_writer.flush();
-                                            }
-                                        }
-                                    }
-                                    Ok(ClientIngressResult::Blocked {
-                                        error_response,
-                                        decision,
-                                    }) => {
-                                        metrics_worker
-                                            .dropped_evaluations
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        write_audit_log_line(
-                                            cfg.audit_log_path.as_deref(),
-                                            &decision.audit_record.to_jsonl_line("mcp_sidecar"),
-                                        );
-                                        // Bloqueo en memoria: CERO conexiones al gateway
-                                        let mut err_str = error_response.to_string();
-                                        err_str.push('\n');
-                                        let _ = client_writer.write_all(err_str.as_bytes());
-                                        let _ = client_writer.flush();
-                                    }
-                                    Err(McpBridgeError::DuplicateInFlightRequestId) => {
-                                        let err_resp = serde_json::json!({
-                                            "jsonrpc": "2.0",
-                                            "id": null,
-                                            "error": {
-                                                "code": -32600,
-                                                "message": "Duplicate in-flight request ID on connection"
-                                            }
-                                        });
-                                        let mut err_str = err_resp.to_string();
-                                        err_str.push('\n');
-                                        let _ = client_writer.write_all(err_str.as_bytes());
-                                        let _ = client_writer.flush();
-                                    }
-                                    Err(e) => {
-                                        let err_resp = serde_json::json!({
-                                            "jsonrpc": "2.0",
-                                            "id": null,
-                                            "error": {
-                                                "code": -32600,
-                                                "message": format!("ILP Protocol error: {}", e)
-                                            }
-                                        });
-                                        let mut err_str = err_resp.to_string();
-                                        err_str.push('\n');
-                                        let _ = client_writer.write_all(err_str.as_bytes());
-                                        let _ = client_writer.flush();
-                                    }
+                                    break;
                                 }
                             }
                         });
@@ -907,6 +1008,94 @@ impl McpSidecarServer {
             drain_timeout,
             metrics,
         })
+    }
+
+    /// Ejecuta el pipeline del Sidecar sobre cualquier par BufRead / Write (útil para pruebas y stdio).
+    pub fn process_stdio_stream<R: BufRead, W: Write>(
+        mut reader: R,
+        mut writer: W,
+        gateway_addr: String,
+        mut firewall: CognitiveFirewall,
+        taint_context: Arc<Mutex<ProcessTaintContext>>,
+        config: SidecarConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client_conn_id = NEXT_CLIENT_CONN_ID.fetch_add(1, Ordering::SeqCst);
+        let correlation = McpSessionCorrelationTable::new();
+        let mut client_taint = taint_context.lock().unwrap().clone();
+        let metrics = ServerMetrics::default();
+
+        loop {
+            let mut line = String::new();
+            let mut take_reader = (&mut reader).take(config.max_line_bytes as u64 + 1);
+            match take_reader.read_line(&mut line) {
+                Ok(0) => {
+                    // EOF alcanzado en el stream de entrada
+                    break;
+                }
+                Ok(_) => {
+                    if line.len() > config.max_line_bytes {
+                        let err_resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": null,
+                            "error": {
+                                "code": -32600,
+                                "message": "Payload size exceeds maximum allowed limit (64 KiB)"
+                            }
+                        });
+                        let mut err_str = err_resp.to_string();
+                        err_str.push('\n');
+                        let _ = writer.write_all(err_str.as_bytes());
+                        let _ = writer.flush();
+
+                        // Descartar el resto de la línea hasta el delimitador '\n' o EOF
+                        let mut discard = String::new();
+                        let _ = reader.read_line(&mut discard);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    return Err(Box::new(e));
+                }
+            }
+
+            if !dispatch_client_jsonrpc_request(
+                &line,
+                &mut writer,
+                &mut firewall,
+                &mut client_taint,
+                &correlation,
+                client_conn_id,
+                &gateway_addr,
+                &config,
+                &metrics,
+            ) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Ejecuta el Sidecar bloqueando sobre stdin y stdout del proceso actual.
+    pub fn run_stdio(
+        gateway_addr: String,
+        firewall: CognitiveFirewall,
+        taint_context: Arc<Mutex<ProcessTaintContext>>,
+        config: SidecarConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stdin = std::io::stdin();
+        let stdin_reader = stdin.lock();
+        let stdout = std::io::stdout();
+        let stdout_writer = stdout.lock();
+
+        Self::process_stdio_stream(
+            stdin_reader,
+            stdout_writer,
+            gateway_addr,
+            firewall,
+            taint_context,
+            config,
+        )
     }
 
     /// Detiene la aceptación de conexiones y drena las conexiones activas de forma ordenada
@@ -939,6 +1128,7 @@ pub struct McpGatewayServer {
     shutdown: Arc<AtomicBool>,
     pub drain_timeout: Duration,
     pub metrics: Arc<ServerMetrics>,
+    child_process: Option<Arc<Mutex<ChildBackendProcess>>>,
 }
 
 #[cfg(feature = "mcp")]
@@ -961,6 +1151,13 @@ impl McpGatewayServer {
         let addr = listener.local_addr()?.to_string();
         listener.set_nonblocking(true)?;
 
+        let child_backend = if let Some(ref cmd) = config.backend_cmd {
+            let child = ChildBackendProcess::spawn(cmd, &config.backend_args)?;
+            Some(Arc::new(Mutex::new(child)))
+        } else {
+            None
+        };
+
         let drain_timeout = config.drain_timeout;
         let shutdown = Arc::new(AtomicBool::new(false));
         let accepted_connections = Arc::new(AtomicUsize::new(0));
@@ -973,6 +1170,7 @@ impl McpGatewayServer {
         let active_clone = Arc::clone(&active_connections);
         let replay_clone = Arc::clone(&replay_guard);
         let metrics_accept = Arc::clone(&metrics);
+        let child_backend_proc = child_backend.clone();
 
         thread::spawn(move || {
             while !shut_clone.load(Ordering::SeqCst) {
@@ -992,6 +1190,7 @@ impl McpGatewayServer {
                         let cfg = config.clone();
                         let replay_ref = Arc::clone(&replay_clone);
                         let metrics_worker = Arc::clone(&metrics_accept);
+                        let child_proc = child_backend_proc.clone();
 
                         thread::spawn(move || {
                             let _permit = permit;
@@ -1199,43 +1398,58 @@ impl McpGatewayServer {
                                 );
                                 write_audit_log_line(cfg.audit_log_path.as_deref(), &log_line);
 
-                                // Comunicación con el servidor de herramientas de backend
+                                // Comunicación con el servidor de herramientas de backend (TCP o Proceso Hijo stdio)
                                 let backend_result = (|| -> Result<McpRpcResponse, String> {
-                                    let mut backend = TcpStream::connect(&backend_target)
-                                        .map_err(|e| format!("Connection error: {}", e))?;
-                                    let _ = backend.set_read_timeout(Some(cfg.io_timeout));
-                                    let _ = backend.set_write_timeout(Some(cfg.io_timeout));
+                                    if let Some(ref child_mutex) = child_proc {
+                                        let mut guard = child_mutex.lock().map_err(|_| {
+                                            "Child backend process mutex poisoned".to_string()
+                                        })?;
+                                        let mut req_str = serde_json::to_string(&mcp_req)
+                                            .map_err(|e| format!("Serialization error: {}", e))?;
+                                        req_str.push('\n');
+                                        let resp_str =
+                                            guard.send_and_receive(&req_str, cfg.max_line_bytes)?;
+                                        serde_json::from_str::<McpRpcResponse>(&resp_str)
+                                            .map_err(|e| format!("Invalid JSON-RPC response from child process: {}", e))
+                                    } else {
+                                        let mut backend = TcpStream::connect(&backend_target)
+                                            .map_err(|e| format!("Connection error: {}", e))?;
+                                        let _ = backend.set_read_timeout(Some(cfg.io_timeout));
+                                        let _ = backend.set_write_timeout(Some(cfg.io_timeout));
 
-                                    let mut req_str = serde_json::to_string(&mcp_req)
-                                        .map_err(|e| format!("Serialization error: {}", e))?;
-                                    req_str.push('\n');
-                                    backend
-                                        .write_all(req_str.as_bytes())
-                                        .map_err(|e| format!("Write error: {}", e))?;
-                                    backend.flush().map_err(|e| format!("Flush error: {}", e))?;
+                                        let mut req_str = serde_json::to_string(&mcp_req)
+                                            .map_err(|e| format!("Serialization error: {}", e))?;
+                                        req_str.push('\n');
+                                        backend
+                                            .write_all(req_str.as_bytes())
+                                            .map_err(|e| format!("Write error: {}", e))?;
+                                        backend
+                                            .flush()
+                                            .map_err(|e| format!("Flush error: {}", e))?;
 
-                                    let mut backend_reader = BufReader::new(backend);
-                                    let mut backend_resp = String::new();
-                                    let mut take_reader =
-                                        (&mut backend_reader).take(cfg.max_line_bytes as u64 + 1);
+                                        let mut backend_reader = BufReader::new(backend);
+                                        let mut backend_resp = String::new();
+                                        let mut take_reader = (&mut backend_reader)
+                                            .take(cfg.max_line_bytes as u64 + 1);
 
-                                    take_reader
-                                        .read_line(&mut backend_resp)
-                                        .map_err(|e| format!("Read error: {}", e))?;
+                                        take_reader
+                                            .read_line(&mut backend_resp)
+                                            .map_err(|e| format!("Read error: {}", e))?;
 
-                                    if backend_resp.is_empty() {
-                                        return Err(
-                                            "Empty response from backend tool server".to_string()
-                                        );
+                                        if backend_resp.is_empty() {
+                                            return Err("Empty response from backend tool server"
+                                                .to_string());
+                                        }
+                                        if backend_resp.len() > cfg.max_line_bytes {
+                                            return Err("Backend response exceeded max line bytes"
+                                                .to_string());
+                                        }
+
+                                        serde_json::from_str::<McpRpcResponse>(&backend_resp)
+                                            .map_err(|e| {
+                                                format!("Invalid JSON-RPC response: {}", e)
+                                            })
                                     }
-                                    if backend_resp.len() > cfg.max_line_bytes {
-                                        return Err(
-                                            "Backend response exceeded max line bytes".to_string()
-                                        );
-                                    }
-
-                                    serde_json::from_str::<McpRpcResponse>(&backend_resp)
-                                        .map_err(|e| format!("Invalid JSON-RPC response: {}", e))
                                 })();
 
                                 let mcp_resp = match backend_result {
@@ -1310,6 +1524,7 @@ impl McpGatewayServer {
             shutdown,
             drain_timeout,
             metrics,
+            child_process: child_backend,
         })
     }
 
@@ -1317,6 +1532,11 @@ impl McpGatewayServer {
     /// hasta que `active_connections == 0` o expire `drain_timeout`.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(ref child_arc) = self.child_process {
+            if let Ok(mut child) = child_arc.lock() {
+                child.terminate();
+            }
+        }
         let start = Instant::now();
         while self.active_connections.load(Ordering::SeqCst) > 0 {
             if start.elapsed() >= self.drain_timeout {

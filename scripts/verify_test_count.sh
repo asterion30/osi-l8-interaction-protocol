@@ -51,7 +51,7 @@ if [ "$TOTAL_FAILED" -ne 0 ]; then
     exit 1
 fi
 
-EXPECTED_COUNT=81
+EXPECTED_COUNT=83
 if [ "$TOTAL_PASSED" -ne "$EXPECTED_COUNT" ]; then
     echo "ERROR: Auditoría fallida. Se esperaban $EXPECTED_COUNT pruebas según la especificación, pero se ejecutaron $TOTAL_PASSED."
     exit 1

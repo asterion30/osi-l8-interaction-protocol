@@ -14,9 +14,9 @@ Este documento detalla la metodología, cobertura y resultados de la suite de pr
 | **TCP Sockets & Transport** | `tests/test_tcp_transport.rs` | 4 | **100% PASS** | Framing sobre streams TCP reales, contención de Allocation Bomb y serialización/deserialización en bucle. |
 | **MCP Shield Bridge** | `tests/test_mcp_bridge.rs` | 11 | **100% PASS** | Mapeo estricto de llamadas MCP JSON-RPC, respuestas y errores; rechazo de IDs en vuelo duplicados, expiración estricta en `resolve_session`, purga automática por TTL y cota fija (1024). |
 | **MCP Proxy E2E Enforcement** | `tests/test_mcp_proxy_e2e.rs` | 18 | **100% PASS** | Servidores de producción (`McpSidecarServer` + `McpGatewayServer`) con túnel 100% binario I-PDU. Cifrado simétrico de payload ChaCha20 (RFC 8439) confidencial en cable (Encrypt-then-MAC), rotación de claves en caliente sin caídas (Dual-PSK), logs forenses JSONL estructurados (`--audit-log`), telemetría atómica (`ServerMetricsSnapshot`), demostración Zero-Connect, cota de línea 64 KiB, concurrencia atómica (CAS), anti-Slowloris con deadline total, auto-manchado dinámico por DLP en ingress, propagación de errores `-32002`, autenticación PSK con SipHash-2-4, orden Verify-Then-Parse, protección anti-replay fail-closed con `ReplayGuard` (-32003), aislamiento estricto de tinte por cliente, anti-colisión CSPRNG en reinicios y multi-sidecar, shutdown graceful con drenaje de conexiones en vuelo, y soporte expandido de métodos MCP. |
-| **CLI Production Binaries** | `tests/test_cli_binaries.rs` | 8 | **100% PASS** | Subprocesos reales de `ilp_mcp_sidecar` e `ilp_mcp_gateway`: flags `--check-config`, guardrail de red no-loopback, carga segura de PSK vía `--psk-file` (permisos Unix 0600 requeridos, rechazo obligatorio de symlinks y hardlinks concurrentes) y variable de entorno `ILP_PSK_HEX`, flujo E2E completo autenticado por PSK, y captura de señales SIGINT/SIGTERM con apagado ordenado y salida código 0. |
+| **CLI Production Binaries** | `tests/test_cli_binaries.rs` | 10 | **100% PASS** | Subprocesos reales de `ilp_mcp_sidecar` e `ilp_mcp_gateway`: flags `--check-config`, guardrail de red no-loopback, carga segura de PSK vía `--psk-file` (permisos Unix 0600 requeridos, rechazo obligatorio de symlinks y hardlinks concurrentes) y variable de entorno `ILP_PSK_HEX`, flujo E2E completo autenticado por PSK, captura de señales SIGINT/SIGTERM con apagado ordenado y salida código 0, túnel completo `--stdio` en Sidecar con aislamiento absoluto de `stdout` y ChaCha20, y puente de subprocesos `--backend-cmd` en Gateway. |
 | **Protocol Handshake** | `tests/test_handshake_simulation.rs` | 1 | **100% PASS** | Negociación completa del 3-Way Intent Handshake entre Cliente y Proveedor con auditoría en ambos firewalls. |
-| **Total General** | **8 Suites + Unit Tests** | **81** | **81 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
+| **Total General** | **8 Suites + Unit Tests** | **83** | **83 PASADAS** | **0 fallos, 0 errores, 0 ignoradas** |
 
 ---
 
@@ -200,6 +200,10 @@ Evalúa los 3 pasos atómicos de intercepción obligatoria (*Mandatory Semantic 
    - Valida que `load_psk_from_file_secure` rechace archivos de clave que posean enlaces duros concurrentes (`nlink > 1`), asegurando acceso exclusivo de propietario según especificación POSIX.
 8. **`test_daemons_graceful_shutdown_on_sigterm`**:
    - Valida la captura de señales POSIX (`SIGINT` / `SIGTERM`) en `ilp_mcp_sidecar` e `ilp_mcp_gateway`: al recibir `SIGTERM`, los daemons interrumpen su bucle de espera, invocan `server.shutdown()`, vuelcan sus métricas operativas finales y salen limpiamente con código `0`.
+9. **`test_e2e_stdio_sidecar_to_gateway_encrypted_tunnel`**:
+   - Valida el modo de transporte `--stdio` en `ilp_mcp_sidecar` comunicándose bidireccionalmente con `ilp_mcp_gateway` sobre I-PDU con cifrado ChaCha20. Comprueba el aislamiento estricto de `stdout` (100% reservado para respuestas JSON-RPC sin logs de inicio ni banners), el bloqueo Zero-Connect en memoria ante inyecciones de prompt sin tráfico hacia el gateway, y el apagado limpio con código de salida 0 tras EOF en `stdin`.
+10. **`test_e2e_gateway_backend_cmd_child_process`**:
+    - Valida la capacidad de `ilp_mcp_gateway` para envolver servidores de herramientas MCP basados en procesos locales vía `--backend-cmd` y `--backend-arg`. Comprueba el intercambio de peticiones `tools/call` a través de pipes `stdin`/`stdout` del subproceso hijo serializados con `Mutex`, y la terminación limpia del proceso backend sin dejar procesos zombis en el sistema.
 
 ---
 
@@ -215,7 +219,7 @@ cargo test --locked --all-targets --all-features
 
 Salida esperada:
 ```text
-test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 83 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ---
@@ -223,7 +227,7 @@ test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ## 4. Notas de Alcance y Modelo de Amenazas
 
 > [!NOTE]
-> **Alcance del DLP Heurístico frente a Cifrado de Transporte:**
-> - El motor DLP integrado (`HeuristicGatekeeper`) y el auto-manchado dinámico operan sobre la carga útil decodificada en texto claro.
-> - Si el tráfico se transporta a través de túneles cifrados externos (ej. mTLS o VPN wire-level), la inspección de Capa 8 debe realizarse en los extremos (Sidecar/Gateway) tras la terminación de TLS.
-> - La autenticación MAC de trama provista por SipHash-2-4 garantiza **integridad y autenticación de origen**, pero no confidencialidad en el canal. Para entornos que requieran confidencialidad en tránsito sobre redes no confiables, debe encapsularse el flujo TCP sobre mTLS o WireGuard.
+> **Alcance del DLP Heurístico y Cifrado Nativo de Transporte:**
+> - El motor DLP integrado (`HeuristicGatekeeper`) y el auto-manchado dinámico operan sobre la carga útil decodificada en texto claro antes de su cifrado o posterior a su descifrado.
+> - La autenticación MAC de trama provista por SipHash-2-4 garantiza **integridad y autenticación de origen**, complementada por el cifrado simétrico nativo de payload con **ChaCha20 (RFC 8439)** bajo el esquema **Encrypt-then-MAC**, garantizando tanto confidencialidad como integridad en tránsito sin dependencias externas.
+> - Adicionalmente, el Gateway soporta rotación en caliente sin caídas (*Zero-Downtime Key Rotation*) aceptando simultáneamente la clave primaria y previa (`psk_previous`).

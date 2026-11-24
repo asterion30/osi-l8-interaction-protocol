@@ -80,7 +80,7 @@ El micro-benchmark de rendimiento fue ejecutado tras un periodo de calentamiento
 ## 🚀 Inicio Rápido (Quickstart)
 
 ```bash
-# 1. Ejecutar la suite completa de 81 pruebas de integración y unitarias
+# 1. Ejecutar la suite completa de 83 pruebas de integración y unitarias
 cargo test --locked --all-targets --all-features
 
 # 2. Auditar formalmente el conteo de pruebas por componente
@@ -237,12 +237,13 @@ osi-l8-interaction-protocol/
 ├── Cargo.toml                                            # Definición de crate ilp-core (zero-deps por defecto)
 ├── LICENSE                                               # Licencia de código MIT
 ├── LICENSE-DOCS                                          # Licencia de documentación CC BY 4.0
-├── deploy/                                               # Infraestructura de despliegue contenerizado y hardened
+├── deploy/                                               # Infraestructura de despliegue contenerizado y seguridad
 │   ├── Dockerfile                                        # Multi-stage build no-root UID 10001 (debian:bookworm-slim)
 │   ├── docker-compose.isolated.yml                       # Red segregada con sandbox interna (internal: true)
-│   └── systemd/                                          # Unidades hardened con sandboxing estricto de Linux
-│       ├── ilp-mcp-sidecar.service                       # Daemon Sidecar protegido
-│       └── ilp-mcp-gateway.service                       # Daemon Gateway protegido
+│   ├── systemd/                                          # Unidades hardened con sandboxing estricto de Linux
+│   │   ├── ilp-mcp-sidecar.service                       # Daemon Sidecar protegido
+│   │   └── ilp-mcp-gateway.service                       # Daemon Gateway protegido
+│   └── siem/wazuh/                                       # Reglas de detección SIEM Wazuh nativas (ilp_rules.xml)
 ├── policies/
 │   └── default_msac.conf                                 # Archivo de políticas declarativas de ejemplo
 ├── scripts/
@@ -254,6 +255,11 @@ osi-l8-interaction-protocol/
 │   └── USER_MANUAL.md                                    # Manual de usuario para migración de entornos
 ├── src/
 │   ├── lib.rs                                            # Re-exportaciones públicas de la biblioteca
+│   ├── main.rs                                           # Demostrador interactivo CLI
+│   ├── bin/
+│   │   ├── ilp_mcp_sidecar.rs                            # Daemon CLI MCP Sidecar (transporte TCP y --stdio)
+│   │   └── ilp_mcp_gateway.rs                            # Daemon CLI MCP Gateway (TCP y subproceso --backend-cmd)
+│   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway, Dual-PSK, ChaCha20)
 │   ├── ipdu/                                             # Cabeceras binarias, empaquetado y performativas
 │   │   ├── flags.rs                                      # CognitivePolicyFlags (16 bits)
 │   │   ├── performatives.rs                              # Speech acts (Discover, Propose, Commit, Attest, Reject)
@@ -266,15 +272,10 @@ osi-l8-interaction-protocol/
 │   │   ├── policy.rs                                     # UserGovernancePolicy, custom DLP y parser .conf
 │   │   ├── gatekeeper.rs                                 # SLM Gatekeeper (DLP, custom regex/substrings y prompt injection)
 │   │   └── firewall.rs                                   # CognitiveFirewall, formato SIEM JSONL y Ring Buffer forense
-│   ├── transport/                                        # Capa de transporte y sesión con estado
-│   │   ├── mod.rs                                        # IlpStream sobre sockets TCP / Read+Write
-│   │   └── session.rs                                    # IlpSession y FSM de 3-Way Intent Handshake
-│   ├── bin/
-│   │   ├── ilp_mcp_sidecar.rs                            # Daemon autónomo CLI de producción MCP Sidecar
-│   │   └── ilp_mcp_gateway.rs                            # Daemon autónomo CLI de producción MCP Gateway
-│   ├── bridge/                                           # Escudo MCP: túnel binario I-PDU (proxy/gateway, Dual-PSK, ChaCha20)
-│   └── main.rs                                           # Demostrador interactivo CLI
-├── tests/                                                # 81 tests de integración y verificación E2E (100% pasando)
+│   └── transport/                                        # Capa de transporte y sesión con estado
+│       ├── mod.rs                                        # IlpStream sobre sockets TCP / Read+Write
+│       └── session.rs                                    # IlpSession y FSM de 3-Way Intent Handshake
+├── tests/                                                # 83 tests de integración y verificación E2E (100% pasando)
 │   ├── test_ipdu_wire.rs                                 # Fuzz, bounds checking, length-prefix MAC y simetría binaria (10 tests)
 │   ├── test_firewall_msac.rs                             # Validación de políticas .conf, taint, custom DLP y MSAC (16 tests)
 │   ├── test_transport_fsm.rs                             # FSM de roles (Initiator/Responder) y plazos (7 tests)
@@ -282,7 +283,7 @@ osi-l8-interaction-protocol/
 │   ├── test_handshake_simulation.rs                      # Simulación multi-turno 3-Way Handshake (1 test)
 │   ├── test_mcp_bridge.rs                                # Mapeo estricto, correlación con TTL, purga e in-flight (11 tests)
 │   ├── test_mcp_proxy_e2e.rs                             # Túnel MCP E2E: ChaCha20, Dual-PSK, JSONL SIEM, Slowloris, ReplayGuard (18 tests)
-│   └── test_cli_binaries.rs                              # Subprocess smoke tests CLI, rechazo symlink/hardlink, SIGTERM graceful (8 tests)
+│   └── test_cli_binaries.rs                              # Subprocess smoke tests CLI, túnel stdio, backend hijo, SIGTERM (10 tests)
 └── examples/
     ├── benchmark_latency.rs                              # Benchmark estadístico riguroso (p50, p95, p99)
     ├── live_agent_proxy.rs                               # Comunicación en vivo entre 2 agentes por TCP

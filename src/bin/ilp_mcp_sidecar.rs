@@ -20,6 +20,7 @@ fn print_help() {
         "Uso: ilp_mcp_sidecar [OPCIONES]\n\n\
         Opciones:\n  \
           --listen <IP:PUERTO>       Dirección de escucha para clientes MCP (default: 127.0.0.1:9001)\n  \
+          --stdio                    Modo transporte stdio (stdin/stdout) para clientes MCP locales (incompatible con --listen)\n  \
           --gateway <IP:PUERTO>      Dirección del Gateway ILP remoto (default: 127.0.0.1:9002)\n  \
           --policy <RUTA>            Ruta al archivo de políticas MSAC (default: policies/default_msac.conf)\n  \
           --initial-taint <TAGS>     Etiquetas iniciales de tinte separadas por coma (ej. medical_pii,financial_data)\n  \
@@ -74,10 +75,23 @@ fn load_psk(psk_file: Option<&str>, psk_hex: Option<&str>) -> Result<Option<[u8;
 }
 
 #[cfg(feature = "mcp")]
+macro_rules! log_msg {
+    ($use_stdio:expr, $($arg:tt)*) => {
+        if $use_stdio {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
+
+#[cfg(feature = "mcp")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let mut listen_addr_str = "127.0.0.1:9001".to_string();
+    let mut listen_specified = false;
+    let mut use_stdio = false;
     let mut gateway_addr_str = "127.0.0.1:9002".to_string();
     let mut policy_path = "policies/default_msac.conf".to_string();
     let mut initial_taint_str: Option<String> = None;
@@ -98,6 +112,10 @@ fn main() {
             }
             "--check-config" => {
                 check_config_only = true;
+                i += 1;
+            }
+            "--stdio" => {
+                use_stdio = true;
                 i += 1;
             }
             "--allow-non-loopback" => {
@@ -130,6 +148,7 @@ fn main() {
                 i += 1;
             }
             "--listen" => {
+                listen_specified = true;
                 if i + 1 < args.len() {
                     listen_addr_str = args[i + 1].clone();
                     i += 2;
@@ -139,6 +158,7 @@ fn main() {
                 }
             }
             opt if opt.starts_with("--listen=") => {
+                listen_specified = true;
                 listen_addr_str = opt.trim_start_matches("--listen=").to_string();
                 i += 1;
             }
@@ -215,17 +235,25 @@ fn main() {
         }
     }
 
-    // Validar direcciones de socket
-    let listen_addr: SocketAddr = match listen_addr_str.parse() {
-        Ok(addr) => addr,
-        Err(e) => {
-            eprintln!(
-                "Error: formato de dirección --listen inválido '{}': {}",
-                listen_addr_str, e
-            );
-            std::process::exit(1);
-        }
-    };
+    if use_stdio && listen_specified {
+        eprintln!("Error: los modos --stdio y --listen son mutuamente excluyentes");
+        std::process::exit(1);
+    }
+
+    // Validar direcciones de socket si no es modo stdio
+    let mut listen_addr: Option<SocketAddr> = None;
+    if !use_stdio {
+        listen_addr = match listen_addr_str.parse() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                eprintln!(
+                    "Error: formato de dirección --listen inválido '{}': {}",
+                    listen_addr_str, e
+                );
+                std::process::exit(1);
+            }
+        };
+    }
     if let Err(e) = gateway_addr_str.parse::<SocketAddr>() {
         eprintln!(
             "Error: formato de dirección --gateway inválido '{}': {}",
@@ -244,12 +272,14 @@ fn main() {
     };
 
     // Guardarraíl de seguridad para interfaces de red no-loopback
-    if !listen_addr.ip().is_loopback() && (!allow_non_loopback || parsed_psk.is_none()) {
-        eprintln!(
-            "Error de seguridad: el enlace a una interfaz de red no-loopback ({}) requiere la especificación explícita de --allow-non-loopback y una clave pre-compartida (vía --psk-file, ILP_PSK_HEX o --psk)",
-            listen_addr
-        );
-        std::process::exit(1);
+    if let Some(l_addr) = listen_addr {
+        if !l_addr.ip().is_loopback() && (!allow_non_loopback || parsed_psk.is_none()) {
+            eprintln!(
+                "Error de seguridad: el enlace a una interfaz de red no-loopback ({}) requiere la especificación explícita de --allow-non-loopback y una clave pre-compartida (vía --psk-file, ILP_PSK_HEX o --psk)",
+                l_addr
+            );
+            std::process::exit(1);
+        }
     }
 
     // Cargar y parsear la política
@@ -303,7 +333,11 @@ fn main() {
 
     if check_config_only {
         println!("✓ Sintaxis de configuración y política MSAC validada exitosamente.");
-        println!("  - Listen Address:  {}", listen_addr);
+        if use_stdio {
+            println!("  - Mode:            stdio (stdin/stdout)");
+        } else {
+            println!("  - Listen Address:  {}", listen_addr_str);
+        }
         println!("  - Gateway Address: {}", gateway_addr_str);
         println!("  - User DID:        {}", policy.user_did);
         println!("  - Max Budget Cap:  {}", policy.max_budget_cap);
@@ -325,14 +359,28 @@ fn main() {
         std::process::exit(0);
     }
 
-    println!("╔══════════════════════════════════════════════════════════════════════════════╗");
-    println!("║   ILP MCP SIDECAR DAEMON - CAPA 8 (RFC-ILP-2026)                             ║");
-    println!("╚══════════════════════════════════════════════════════════════════════════════╝");
-    println!("• Ingress MCP JSON-RPC:  {}", listen_addr);
-    println!("• Egress ILP I-PDU:      {}", gateway_addr_str);
-    println!("• Archivo de Políticas:  {}", policy_path);
-    println!("• DID de Gobernanza:     {}", policy.user_did);
-    println!(
+    log_msg!(
+        use_stdio,
+        "╔══════════════════════════════════════════════════════════════════════════════╗"
+    );
+    log_msg!(
+        use_stdio,
+        "║   ILP MCP SIDECAR DAEMON - CAPA 8 (RFC-ILP-2026)                             ║"
+    );
+    log_msg!(
+        use_stdio,
+        "╚══════════════════════════════════════════════════════════════════════════════╝"
+    );
+    if use_stdio {
+        log_msg!(use_stdio, "• Ingress MCP JSON-RPC:  stdio (stdin/stdout)");
+    } else {
+        log_msg!(use_stdio, "• Ingress MCP JSON-RPC:  {}", listen_addr_str);
+    }
+    log_msg!(use_stdio, "• Egress ILP I-PDU:      {}", gateway_addr_str);
+    log_msg!(use_stdio, "• Archivo de Políticas:  {}", policy_path);
+    log_msg!(use_stdio, "• DID de Gobernanza:     {}", policy.user_did);
+    log_msg!(
+        use_stdio,
         "• Autenticación PSK:     {}",
         if parsed_psk.is_some() {
             "Activa (SipHash-2-4)"
@@ -340,7 +388,8 @@ fn main() {
             "Inactiva (Dev Mode)"
         }
     );
-    println!(
+    log_msg!(
+        use_stdio,
         "• Trust Client Claims:   {}",
         if trust_client_claims {
             "Habilitado (claims cliente aceptados)"
@@ -353,7 +402,7 @@ fn main() {
     let mut process_ctx = ProcessTaintContext::new(std::process::id(), "ilp_mcp_sidecar", true);
 
     for (tag, name) in initial_tags {
-        println!("• Pre-manchado con Taint: {} ({})", name, tag);
+        log_msg!(use_stdio, "• Pre-manchado con Taint: {} ({})", name, tag);
         process_ctx.apply_taint(tag, &format!("cli:initial_taint:{}", name));
     }
 
@@ -366,6 +415,20 @@ fn main() {
         trust_client_taint_claims: trust_client_claims,
         ..Default::default()
     };
+
+    if use_stdio {
+        log_msg!(
+            use_stdio,
+            "✓ Sidecar ejecutándose en modo transporte stdio (delimitado por líneas)."
+        );
+        if let Err(e) =
+            McpSidecarServer::run_stdio(gateway_addr_str, firewall, taint_context, config)
+        {
+            eprintln!("[ERROR] Fallo en transporte stdio del Sidecar: {}", e);
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
 
     let server = match McpSidecarServer::start(
         &listen_addr_str,

@@ -16,6 +16,8 @@ fn print_help() {
         Opciones:\n  \
           --listen <IP:PUERTO>       Dirección de escucha para tramas binarias I-PDU (default: 127.0.0.1:9002)\n  \
           --backend <IP:PUERTO>      Dirección del servidor de herramientas MCP local (default: 127.0.0.1:8080)\n  \
+          --backend-cmd <COMANDO>    Ejecuta un servidor MCP como subproceso stdio (incompatible con --backend)\n  \
+          --backend-arg <ARG>        Argumento para el subproceso backend (repetible)\n  \
           --max-conns <N>            Máximo de conexiones concurrentes permitidas (default: 128)\n  \
           --timeout-ms <MS>          Tiempo límite para operaciones de E/S en milisegundos (default: 5000)\n  \
           --psk-file <RUTA>          Carga clave pre-compartida de 128 bits desde archivo (requiere permisos 0600 o 0400)\n  \
@@ -100,6 +102,9 @@ fn main() {
 
     let mut listen_addr_str = "127.0.0.1:9002".to_string();
     let mut backend_addr_str = "127.0.0.1:8080".to_string();
+    let mut backend_specified = false;
+    let mut backend_cmd: Option<String> = None;
+    let mut backend_args: Vec<String> = Vec::new();
     let mut max_conns = 128usize;
     let mut timeout_ms = 5000u64;
     let mut psk_str: Option<String> = None;
@@ -123,6 +128,32 @@ fn main() {
             }
             "--allow-non-loopback" => {
                 allow_non_loopback = true;
+                i += 1;
+            }
+            "--backend-cmd" => {
+                if i + 1 < args.len() {
+                    backend_cmd = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --backend-cmd requiere un comando ejecutable");
+                    std::process::exit(1);
+                }
+            }
+            opt if opt.starts_with("--backend-cmd=") => {
+                backend_cmd = Some(opt.trim_start_matches("--backend-cmd=").to_string());
+                i += 1;
+            }
+            "--backend-arg" => {
+                if i + 1 < args.len() {
+                    backend_args.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --backend-arg requiere un argumento de texto");
+                    std::process::exit(1);
+                }
+            }
+            opt if opt.starts_with("--backend-arg=") => {
+                backend_args.push(opt.trim_start_matches("--backend-arg=").to_string());
                 i += 1;
             }
             "--psk-previous-file" => {
@@ -181,6 +212,7 @@ fn main() {
                 i += 1;
             }
             "--backend" => {
+                backend_specified = true;
                 if i + 1 < args.len() {
                     backend_addr_str = args[i + 1].clone();
                     i += 2;
@@ -190,6 +222,7 @@ fn main() {
                 }
             }
             opt if opt.starts_with("--backend=") => {
+                backend_specified = true;
                 backend_addr_str = opt.trim_start_matches("--backend=").to_string();
                 i += 1;
             }
@@ -271,6 +304,11 @@ fn main() {
         }
     }
 
+    if backend_specified && backend_cmd.is_some() {
+        eprintln!("Error: los modos --backend y --backend-cmd son mutuamente excluyentes");
+        std::process::exit(1);
+    }
+
     // Validar direcciones de socket
     let listen_addr: SocketAddr = match listen_addr_str.parse() {
         Ok(addr) => addr,
@@ -282,12 +320,14 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = backend_addr_str.parse::<SocketAddr>() {
-        eprintln!(
-            "Error: formato de dirección --backend inválido '{}': {}",
-            backend_addr_str, e
-        );
-        std::process::exit(1);
+    if backend_cmd.is_none() {
+        if let Err(e) = backend_addr_str.parse::<SocketAddr>() {
+            eprintln!(
+                "Error: formato de dirección --backend inválido '{}': {}",
+                backend_addr_str, e
+            );
+            std::process::exit(1);
+        }
     }
 
     // Cargar PSK con orden de prioridad: --psk-file > ILP_PSK_HEX > --psk
@@ -323,7 +363,14 @@ fn main() {
     if check_config_only {
         println!("✓ Configuración del Gateway ILP validada exitosamente.");
         println!("  - Listen Address:  {}", listen_addr);
-        println!("  - Backend Target:  {}", backend_addr_str);
+        if let Some(ref cmd) = backend_cmd {
+            println!(
+                "  - Backend Target:  Proceso hijo stdio: {} {:?}",
+                cmd, backend_args
+            );
+        } else {
+            println!("  - Backend Target:  {}", backend_addr_str);
+        }
         println!("  - Max Conns:       {}", max_conns);
         println!("  - Timeout:         {} ms", timeout_ms);
         println!(
@@ -349,7 +396,14 @@ fn main() {
     println!("║   ILP MCP GATEWAY DAEMON - CAPA 8 (RFC-ILP-2026)                             ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
     println!("• Ingress ILP I-PDU:     {}", listen_addr);
-    println!("• Backend MCP Tool:      {}", backend_addr_str);
+    if let Some(ref cmd) = backend_cmd {
+        println!(
+            "• Backend MCP Tool:      Proceso hijo stdio: {} (args: {:?})",
+            cmd, backend_args
+        );
+    } else {
+        println!("• Backend MCP Tool:      {}", backend_addr_str);
+    }
     println!("• Conexiones Máximas:    {}", max_conns);
     println!("• Timeout de E/S:        {} ms", timeout_ms);
     println!(
@@ -370,6 +424,8 @@ fn main() {
         psk: parsed_psk,
         psk_previous: parsed_psk_previous,
         audit_log_path,
+        backend_cmd,
+        backend_args,
         ..Default::default()
     };
 

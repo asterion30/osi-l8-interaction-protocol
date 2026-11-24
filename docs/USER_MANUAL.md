@@ -55,7 +55,7 @@ Este manual proporciona una guía integral para entender, compilar, ejecutar y t
 # Compilar la biblioteca y binarios
 cargo build --locked
 
-# Ejecutar la suite completa de tests unitarios y de integración (81 tests)
+# Ejecutar la suite completa de tests unitarios y de integración (83 tests)
 cargo test --locked --all-targets --all-features
 
 # Auditar y verificar el conteo formal de pruebas
@@ -260,8 +260,8 @@ Para impedir la inyección directa de tramas I-PDU espurias contra el Gateway, a
 
 El proyecto provee dos binarios de línea de comandos independientes:
 
-- **`ilp_mcp_sidecar`**: Intercepta tráfico JSON-RPC del agente, audita con MSAC (Zero-Connect: jamás abre TCP al gateway si la política rechaza), auto-mancha dinámicamente el proceso ante respuestas con datos sensibles (`DLP Ingress`), cifra payloads con ChaCha20 (RFC 8439), firma tramas con PSK SipHash-2-4 y maneja concurrencia atómica (CAS) sin condiciones de carrera. Soporta `--audit-log <PATH>`.
-- **`ilp_mcp_gateway`**: Recibe paquetes binarios I-PDU del sidecar sobre `IlpStream`, ejecuta Verify-Then-Parse con soporte Dual-PSK, descifra el payload ChaCha20, filtra con anti-replay fail-closed, despacha JSON-RPC al backend de herramientas MCP y propaga errores estructurados (`-32002`) si el backend está inalcanzable. Soporta `--audit-log <PATH>`.
+- **`ilp_mcp_sidecar`**: Intercepta tráfico JSON-RPC del agente (sobre TCP o mediante transporte `--stdio`), audita con MSAC (Zero-Connect: jamás abre TCP al gateway si la política rechaza), auto-mancha dinámicamente el proceso ante respuestas con datos sensibles (`DLP Ingress`), cifra payloads con ChaCha20 (RFC 8439), firma tramas con PSK SipHash-2-4 y maneja concurrencia atómica (CAS) sin condiciones de carrera. Soporta `--stdio` para integración nativa con clientes locales (Claude Desktop, Cursor) y exportación forense `--audit-log <PATH>`.
+- **`ilp_mcp_gateway`**: Recibe paquetes binarios I-PDU del sidecar sobre `IlpStream`, ejecuta Verify-Then-Parse con soporte Dual-PSK, descifra el payload ChaCha20, filtra con anti-replay fail-closed, despacha JSON-RPC al backend de herramientas MCP (ya sea por TCP con `--backend` o lanzando un subproceso hijo local con `--backend-cmd` y `--backend-arg`) y propaga errores estructurados (`-32002`) si el backend está inalcanzable. Soporta `--audit-log <PATH>`.
 
 ```bash
 # Validar sintaxis y configuración sin iniciar los servidores (--check-config)
@@ -269,7 +269,46 @@ cargo run --bin ilp_mcp_sidecar --features mcp -- --check-config --policy polici
 ILP_PSK_HEX="00112233445566778899aabbccddeeff" cargo run --bin ilp_mcp_gateway --features mcp -- --check-config
 ```
 
-#### 4. Guía de Despliegue en 3 Terminales (Quickstart)
+#### 4. Transporte Stdio & Integración con Clientes de Escritorio (Claude Desktop / Cursor)
+
+Cuando un cliente MCP local (como Claude Desktop o Cursor) ejecuta herramientas lanzando subprocesos en lugar de conectarse por TCP, `ilp_mcp_sidecar` puede invocarse en modo `--stdio`.
+
+> [!IMPORTANT]
+> **Aislamiento Absoluto de Stdio:** En modo `--stdio`, el Sidecar redirige **todos** los banners de inicio, diagnósticos y métricas de cierre a `stderr`. El descriptor `stdout` queda reservado al 100% para respuestas JSON-RPC válidas delimitadas por `\n`, previniendo corrupción de tramas en el parser del cliente LLM.
+
+Ejemplo de configuración en `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "capa8-shield": {
+      "command": "/usr/local/bin/ilp_mcp_sidecar",
+      "args": [
+        "--stdio",
+        "--gateway", "192.168.1.50:9002",
+        "--policy", "/etc/capa8/msac.conf",
+        "--psk-file", "/etc/capa8/psk.key"
+      ]
+    }
+  }
+}
+```
+
+#### 5. Gateway con Subproceso Backend (`--backend-cmd`)
+
+Para envolver servidores de herramientas MCP basados en stdio (Node.js, Python, binarios) directamente en el Gateway remoto sin levantar un servidor TCP intermedio:
+
+```bash
+cargo run --bin ilp_mcp_gateway --features mcp -- \
+    --listen 127.0.0.1:9002 \
+    --backend-cmd npx \
+    --backend-arg -y \
+    --backend-arg @modelcontextprotocol/server-filesystem \
+    --backend-arg /var/shared/data \
+    --psk-file /etc/capa8/psk.key \
+    --audit-log /var/log/capa8/gateway_audit.jsonl
+```
+
+#### 6. Guía de Despliegue en Terminales TCP (Quickstart)
 
 Sigue estos pasos para desplegar la arquitectura completa en terminales independientes:
 
@@ -288,7 +327,8 @@ python3 -m http.server 8080   # o tu servidor MCP real: npx -y @modelcontextprot
 # ------------------------------------------------------------------------------
 cargo run --bin ilp_mcp_gateway --features mcp -- \
     --listen 127.0.0.1:9002 \
-    --backend 127.0.0.1:8080
+    --backend 127.0.0.1:8080 \
+    --audit-log /var/log/capa8/gateway_audit.jsonl
 
 # ------------------------------------------------------------------------------
 # TERMINAL 3: ILP MCP Sidecar Daemon (recibe JSON-RPC en 9001 -> reenvía a 9002)
@@ -297,7 +337,8 @@ cargo run --bin ilp_mcp_sidecar --features mcp -- \
     --listen 127.0.0.1:9001 \
     --gateway 127.0.0.1:9002 \
     --policy policies/default_msac.conf \
-    --initial-taint MedicalPii,Credentials
+    --initial-taint MedicalPii,Credentials \
+    --audit-log /var/log/capa8/sidecar_audit.jsonl
 
 # ------------------------------------------------------------------------------
 # TERMINAL 4: Agente / Cliente MCP (Prueba interactiva)
@@ -306,7 +347,16 @@ cargo run --bin ilp_mcp_sidecar --features mcp -- \
 echo '{"jsonrpc":"2.0","id":"req-01","method":"tools/call","params":{"name":"query_records","arguments":{}}}' | nc 127.0.0.1 9001
 ```
 
-#### 5. Servidores Programáticos en Rust (`McpSidecarServer` y `McpGatewayServer`)
+#### 7. Integración SIEM Wazuh
+
+Los registros JSONL generados por `--audit-log` son ingeridos de forma nativa por Wazuh. El conjunto de reglas en `deploy/siem/wazuh/ilp_rules.xml` mapea eventos a MITRE ATT&CK:
+- Regla 100310: Inyección de Prompt (*T1059 / T1548*).
+- Regla 100311: Exfiltración de datos sensibles DLP (*T1041*).
+- Regla 100320: Violación de política de contención de tinte (*T1562*).
+- Regla 100330: Ataque de repetición ReplayGuard (*T1565*).
+- Regla 100340: Falsificación de firma criptográfica MAC (*T1565*).
+
+#### 8. Servidores Programáticos en Rust (`McpSidecarServer` y `McpGatewayServer`)
 ```rust
 use ilp_core::bridge::{McpGatewayServer, McpSidecarServer, SidecarConfig};
 
@@ -322,7 +372,7 @@ let gateway = McpGatewayServer::start("127.0.0.1:9002", "127.0.0.1:8080".to_stri
 let sidecar = McpSidecarServer::start("127.0.0.1:9001", gateway.addr.clone(), firewall, taint_context, config)?;
 ```
 
-#### 6. Demostración Interactiva del Escudo MCP
+#### 9. Demostración Interactiva del Escudo MCP
 Para probar el demo interactivo:
 ```bash
 cargo run --example mcp_shield_demo --features mcp
